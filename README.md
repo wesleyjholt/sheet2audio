@@ -62,6 +62,8 @@ The output goes to `my-piece_sheet2audio/`, next to the PDF:
 ### On an iPhone or iPad (free, nothing to install)
 
 - **Video.** AirDrop `my-piece.mp4` to the phone, or save it to iCloud Drive. It opens in Photos or Files and plays with the notes lighting up. Turn the phone sideways for a bigger score.
+  - Format: 1080p H.264 with AAC sound, about 6 MB per 3 minutes of music.
+  - Speed: drawing it adds roughly 10 s per minute of music.
 - **Audio only.** `my-piece.mp3` or `my-piece.m4a` (`--formats mp3,m4a`) plays in the Files app.
 - **Interactive page.** You can tap notes and change the speed. iOS won't run the page's script from the Files app, so serve it from the Mac instead:
 
