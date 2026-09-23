@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+  :root {
+    --bg: #f4f2ee; --panel: #ffffff; --ink: #1d1d1f; --muted: #6b6b70;
+    --line: #dedbd4; --accent: #c2410c; --paper: #ffffff; --warn-bg: #fff7e6; --warn-ink: #7a4b00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #17171a; --panel: #222226; --ink: #ececef; --muted: #9a9aa2;
+      --line: #34343a; --accent: #fb923c; --paper: #fbfaf7; --warn-bg: #3a2e14; --warn-ink: #f5d38a;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #17171a; --panel: #222226; --ink: #ececef; --muted: #9a9aa2;
+    --line: #34343a; --accent: #fb923c; --paper: #fbfaf7; --warn-bg: #3a2e14; --warn-ink: #f5d38a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { position: sticky; top: 0; z-index: 10; background: var(--panel);
+    border-bottom: 1px solid var(--line); padding: 10px 16px; }
+  .bar { max-width: 1100px; margin: 0 auto; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+  h1 { font-size: 16px; margin: 0; font-weight: 600; flex: 1 1 200px; min-width: 0;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  audio { flex: 2 1 320px; min-width: 0; height: 36px; }
+  label { color: var(--muted); font-size: 13px; display: inline-flex; gap: 6px; align-items: center; }
+  select { font: inherit; font-size: 13px; }
+  main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  details.notes { background: var(--warn-bg); color: var(--warn-ink); border-radius: 8px;
+    padding: 8px 12px; margin-bottom: 14px; font-size: 13px; }
+  details.notes summary { cursor: pointer; font-weight: 600; }
+  details.notes ul { margin: 6px 0 2px 18px; padding: 0; }
+  h2 { font-size: 14px; color: var(--muted); font-weight: 600; margin: 22px 0 8px; }
+  .page { background: var(--paper); color: #000; border-radius: 6px; margin: 0 0 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.12); padding: 8px; }
+  .page svg { display: block; width: 100%; height: auto; }
+  .page g.note { cursor: pointer; }
+  .page g.note.playing { fill: var(--accent); color: var(--accent); }
+  footer { color: var(--muted); font-size: 12px; text-align: center; padding: 8px 16px 32px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <h1 id="title"></h1>
+    <audio id="audio" controls preload="auto" src="__AUDIO_SRC__"></audio>
+    <label>Speed
+      <select id="speed">
+        <option value="0.5">0.5×</option><option value="0.75">0.75×</option>
+        <option value="1" selected>1×</option><option value="1.25">1.25×</option>
+        <option value="1.5">1.5×</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="follow" checked> Follow</label>
+  </div>
+</header>
+<main>
+  <div id="notes"></div>
+  <div id="score"></div>
+</main>
+<footer>Click any note to jump there. Space bar plays and pauses. Made with Audiveris, Verovio and FluidSynth.</footer>
+<script type="application/json" id="data">__DATA__</script>
+<script>
+(function () {
+  "use strict";
+  var data = JSON.parse(document.getElementById("data").textContent);
+  var audio = document.getElementById("audio");
+  document.getElementById("title").textContent = data.title;
+  document.title = data.title;
+
+  if (data.notes && data.notes.length) {
+    var d = document.createElement("details");
+    d.className = "notes";
+    var s = document.createElement("summary");
+    s.textContent = data.notes.length + " thing" + (data.notes.length > 1 ? "s" : "") +
+      " to check (optical music recognition is not perfect)";
+    d.appendChild(s);
+    var ul = document.createElement("ul");
+    data.notes.forEach(function (n) { var li = document.createElement("li"); li.textContent = n; ul.appendChild(li); });
+    d.appendChild(ul);
+    document.getElementById("notes").appendChild(d);
+  }
+
+  // Lay out the engraved pages. Verovio's ids are unique within one movement,
+  // so each movement's ids are prefixed with its index.
+  var score = document.getElementById("score");
+  var byId = new Map();
+  data.movements.forEach(function (mv, mi) {
+    if (data.movements.length > 1) {
+      var h = document.createElement("h2");
+      h.textContent = mv.title;
+      score.appendChild(h);
+    }
+    mv.svgs.forEach(function (svg) {
+      var div = document.createElement("div");
+      div.className = "page";
+      div.innerHTML = svg;
+      div.querySelectorAll("[data-id]").forEach(function (el) {
+        var key = mi + ":" + el.getAttribute("data-id");
+        el.setAttribute("data-key", key);
+        byId.set(key, el);
+      });
+      score.appendChild(div);
+    });
+  });
+
+  // One global, time-sorted event list across movements.
+  var events = [];
+  var onsetOf = new Map();
+  data.movements.forEach(function (mv, mi) {
+    mv.timemap.forEach(function (e) {
+      var t = e.tstamp + mv.offset_ms;
+      var ev = { t: t, on: [], off: [], measure: null };
+      (e.off || []).forEach(function (id) { ev.off.push(mi + ":" + id); });
+      (e.on || []).forEach(function (id) {
+        var key = mi + ":" + id;
+        ev.on.push(key);
+        if (!onsetOf.has(key)) onsetOf.set(key, t);
+      });
+      if (e.measureOn) {
+        ev.measure = mi + ":" + e.measureOn;
+        if (!onsetOf.has(ev.measure)) onsetOf.set(ev.measure, t);
+      }
+      events.push(ev);
+    });
+  });
+  events.sort(function (a, b) { return a.t - b.t; });
+
+  var idx = 0, lastT = -1, active = new Map(); // key -> count of overlapping soundings
+  function setOn(key) {
+    var n = (active.get(key) || 0) + 1;
+    active.set(key, n);
+    var el = byId.get(key);
+    if (el) el.classList.add("playing");
+    return el;
+  }
+  function setOff(key) {
+    var n = (active.get(key) || 0) - 1;
+    if (n > 0) { active.set(key, n); return; }
+    active.delete(key);
+    var el = byId.get(key);
+    if (el) el.classList.remove("playing");
+  }
+  function reset() {
+    active.forEach(function (_, key) { var el = byId.get(key); if (el) el.classList.remove("playing"); });
+    active.clear();
+    idx = 0;
+  }
+  function advance(tms) {
+    if (tms < lastT) reset();
+    var lead = null;
+    while (idx < events.length && events[idx].t <= tms) {
+      var ev = events[idx++];
+      ev.off.forEach(setOff);
+      ev.on.forEach(function (k) { var el = setOn(k); if (el && !lead) lead = el; });
+    }
+    lastT = tms;
+    if (lead && document.getElementById("follow").checked) follow(lead);
+  }
+  function follow(el) {
+    var sys = el.closest("g.system") || el;
+    var r = sys.getBoundingClientRect();
+    var top = document.querySelector("header").getBoundingClientRect().bottom;
+    var vh = window.innerHeight;
+    if (r.top < top + 8 || r.bottom > vh - 8) {
+      window.scrollTo({ top: window.scrollY + r.top - top - 16, behavior: "smooth" });
+    }
+  }
+
+  var raf = null;
+  function tick() {
+    advance(audio.currentTime * 1000);
+    raf = audio.paused ? null : requestAnimationFrame(tick);
+  }
+  audio.addEventListener("play", function () { if (!raf) raf = requestAnimationFrame(tick); });
+  audio.addEventListener("seeked", function () { advance(audio.currentTime * 1000); });
+  audio.addEventListener("pause", function () { advance(audio.currentTime * 1000); });
+  audio.addEventListener("ended", reset);
+  document.getElementById("speed").addEventListener("change", function (e) {
+    audio.playbackRate = parseFloat(e.target.value);
+  });
+
+  score.addEventListener("click", function (e) {
+    var el = e.target.closest("g.note") || e.target.closest("g.measure");
+    if (!el) return;
+    var key = el.getAttribute("data-key");
+    if (key && onsetOf.has(key)) {
+      audio.currentTime = onsetOf.get(key) / 1000;
+      if (audio.paused) audio.play();
+    }
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.code === "Space" && !/^(INPUT|SELECT|TEXTAREA|AUDIO|BUTTON)$/.test(e.target.tagName)) {
+      e.preventDefault();
+      if (audio.paused) audio.play(); else audio.pause();
+    }
+  });
+})();
+</script>
+</body>
+</html>
