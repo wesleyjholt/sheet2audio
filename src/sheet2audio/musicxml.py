@@ -234,6 +234,13 @@ def _align_part_barlines(root: ET.Element) -> list[Note]:
                 return []  # an empty bar in one part only: too ambiguous to re-bar
             t += length
         per_part.append((ms, ctx, starts))
+    # A missed bar line leaves a part with fewer bars but the same total length.
+    # Equal bar counts or different totals mean short/long bars (repair's job).
+    counts = {len(ms) for ms, _, _ in per_part}
+    totals = {sum((_measure_length(m, c[0]) for m, c in zip(ms, ctx)), Fraction(0))
+              for ms, ctx, _ in per_part}
+    if len(counts) == 1 or len(totals) != 1:
+        return []
     common = set.intersection(*(set(s) for _, _, s in per_part))
     if all(set(s) == common for _, _, s in per_part):
         return []
@@ -247,6 +254,13 @@ def _align_part_barlines(root: ET.Element) -> list[Note]:
                 groups[-1].append(i)
         plans.append(groups)
     if len({len(g) for g in plans}) != 1:
+        return []
+    # The same part(s) must have missed the bar line(s) in every group that is
+    # joined; if different parts are "short" in different places, the parts
+    # are not simply missing bar lines, and joining would move music.
+    sides = {frozenset(k for k, groups in enumerate(plans) if len(groups[g]) > 1)
+             for g in range(len(plans[0])) if any(len(groups[g]) > 1 for groups in plans)}
+    if len(sides) != 1:
         return []
     # Every group that must be joined, in every part, has to be joinable.
     for (ms, ctx, _), groups in zip(per_part, plans):
@@ -420,8 +434,13 @@ def _fix_part_mapping(root: ET.Element) -> list[Note]:
                     continue  # q sings on this line: not a free staff
                 elsewhere_p = _part_pitches(ms[:a] + ms[b:])
                 elsewhere_q = _part_pitches(qms[:a] + qms[b:])
-                if not elsewhere_q or abs(_median(here) - _median(elsewhere_q)) >= \
-                        abs(_median(here) - _median(elsewhere_p)):
+                if not elsewhere_q or not elsewhere_p:
+                    continue
+                # Move only when the line clearly lies outside p's range and
+                # inside q's (a tenor line in treble clef stays put).
+                outside_p = sum(1 for x in here if not min(elsewhere_p) <= x <= max(elsewhere_p))
+                inside_q = sum(1 for x in here if min(elsewhere_q) <= x <= max(elsewhere_q))
+                if outside_p < 0.8 * len(here) or inside_q < 0.8 * len(here):
                     continue
                 for i in range(a, b):
                     pm, qm = ms[i], qms[i]
@@ -1212,10 +1231,19 @@ def repair(root: ET.Element, heard: Callable[[ET.Element], list[Fraction]],
         beat_type = _beat_type(parts[0], i)
         beats = lengths[i] * beat_type / 4
         label = f"{num(i)}–{num(j)}"
+        gap = bars[i] - lengths[i]
+        # Other bars short by the same amount: these are missed rests, not a
+        # missed time signature; let the padding below handle them.
+        elsewhere = [k for k in range(1, n - 1) if not i <= k <= j
+                     and bars[k] is not None and bars[k] - lengths[k] == gap]
+        if gap > 0 and elsewhere:
+            continue
         if apply and beats.denominator == 1 and 1 <= beats <= 32:
             _set_time_at(parts, i, int(beats), beat_type)
             back = bars[i] * beat_type / 4
-            if j + 1 < n and lengths[j + 1] == bars[i] and back.denominator == 1:
+            own_time = j + 1 < n and any(a.find("time") is not None
+                                         for a in measures0[j + 1].findall("attributes"))
+            if j + 1 < n and back.denominator == 1 and not own_time:
                 _set_time_at(parts, j + 1, int(back), beat_type)  # and back again
             rep.notes.append(f"Measures {label} all play {_fmt(lengths[i])} beats but the time "
                              f"signature said {_fmt(bars[i])}: a time signature was probably "

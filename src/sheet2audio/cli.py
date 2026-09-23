@@ -29,8 +29,9 @@ import urllib.parse
 from pathlib import Path
 
 from . import musicxml, omr, synth, tools
-from .render import (MovementJob, RenderError, combine_midi, mix_tracks, process_movements,
-                     track_names, track_notes)
+from .render import (MovementJob, RenderError, channels_needed, combine_midi, describe_parts,
+                     in_children,
+                     mix_tracks, process_movements, track_names, track_notes)
 from .video import VideoError, VideoMovement, render_video
 from .viewer import Player, write_viewer
 
@@ -105,8 +106,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
                    help="'encoded' keeps the line breaks of the original page (default); "
                         "'auto' lets Verovio re-flow the music")
     p.add_argument("--link-audio", action="store_true",
-                   help="make the HTML page load its sounds from a file next to it instead of "
-                        "embedding them")
+                   help="write the page's sounds to <name>.samples.js next to the page instead "
+                        "of embedding them (keep the two files together)")
     p.add_argument("--sheets", help="only these pages, e.g. '1 3-4' (PDF/image input)")
     p.add_argument("--audiveris", help="path to the Audiveris executable or Audiveris.app")
     p.add_argument("--open", action="store_true", help="open the play-along page when done")
@@ -131,6 +132,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         except ValueError as e:
             p.error(f"--sheets: {e}")
     a.parts = [x.strip() for x in a.parts.split(",")] if a.parts else None
+    for entry in a.parts or []:
+        halves = [x.strip() for x in re.split(r"[/|]", entry)] if entry else []
+        if entry and any(not x for x in halves):
+            p.error(f"--parts: '{entry}' has an empty name")
+        if any(len(x) > 60 for x in halves):
+            p.error(f"--parts: '{entry}' is too long (at most 60 characters per name)")
     if a.serve is not None and not 1 <= a.serve <= 65535:
         p.error("--serve: port must be between 1 and 65535")
     return a
@@ -258,7 +265,8 @@ def run(argv: list[str] | None = None) -> dict:
     fluidsynth = tools.find_fluidsynth()
     ffmpeg = tools.find_ffmpeg()
     soundfont = tools.find_soundfont(a.soundfont)
-    codecs = synth.plan_codecs(ffmpeg, a.formats + ["mp3"])  # mp3 also for samples, rehearsal
+    # MP3 is also needed for the page's sounds; rehearsal tracks check later.
+    codecs = synth.plan_codecs(ffmpeg, a.formats + ([] if a.no_viewer else ["mp3"]))
     audiveris = tools.find_audiveris(a.audiveris) if suffix not in omr.MUSICXML_SUFFIXES else None
     notes: list[str] = []
     rsvg = None if a.no_video else tools.find_rsvg()
@@ -336,12 +344,31 @@ def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codec
     for root in roots:
         musicxml.untag(root)
 
-    # 3. Repair and engrave each movement (in child processes)
+    # 3. Name the parts once for the whole piece, so a movement where one voice
+    # rests cannot shift the names; then repair and engrave each movement.
+    xmls = [musicxml.to_bytes(r) for r in roots]
+    if a.parts:
+        entries = [a.parts] * len(roots)
+        hands = False
+    else:
+        described = in_children(describe_parts, xmls)
+        entries = [[] for _ in roots]
+        for _sn, first, pieces in file_notes:  # pieces of one file share one part list
+            group = described[first:first + len(pieces)]
+            merged = []
+            for gi in range(max((len(d) for d in group), default=0)):
+                sung = [d[gi][0] for d in group if gi < len(d) and d[gi][2] and d[gi][0]]
+                merged.append(sung[0] if sung else "")
+            for k in range(first, first + len(pieces)):
+                entries[k] = merged
+        hands = all(sum(1 for e, kind, has in d if has) == 1
+                    and all(kind == "accompaniment" for e, kind, has in d if has)
+                    for d in described)
     log.step(f"Engraving {len(roots)} movement(s) with Verovio")
-    jobs = [MovementJob(xml=musicxml.to_bytes(r), title=t, repair=not a.no_repair, bpm=a.bpm,
+    jobs = [MovementJob(xml=x, title=t, repair=not a.no_repair, bpm=a.bpm,
                         tempo_scale=a.tempo_scale, layout=a.layout, video=rsvg is not None,
-                        parts=a.parts or [])
-            for r, t in zip(roots, titles)]
+                        parts=e, hands=hands)
+            for x, t, e in zip(xmls, titles, entries)]
     results = process_movements(jobs)
     rendered = [r.rendered for r in results]
     xml_paths = []
@@ -405,6 +432,9 @@ def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codec
         for r, off in movs]
     if voices:
         log.step("Parts: " + ", ".join(names))
+    if channels_needed(rendered, programs) > 15:
+        notes.append(f"The score has {len(names)} parts with more different sounds than MIDI's "
+                     "15 channels; some parts share a channel (and a volume) in the audio files.")
 
     # 5. Audio, video, play-along page
     log.step(f"Synthesizing audio with FluidSynth ({soundfont.name})")
@@ -417,7 +447,12 @@ def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codec
         gain = synth.encode(ffmpeg, raw, outputs, codecs, end_s)
 
         downloads = []
-        if len(voices) >= 2 and not a.no_rehearsal:
+        if len(voices) >= 2 and not a.no_rehearsal and "mp3" not in codecs:
+            try:
+                codecs.update(synth.plan_codecs(ffmpeg, ["mp3"]))
+            except synth.SynthError as e:
+                notes.append(f"No rehearsal tracks: {e}")
+        if len(voices) >= 2 and not a.no_rehearsal and "mp3" in codecs:
             log.step("Rehearsal tracks: " + ", ".join(voices))
             report["rehearsal"] = {}
             mixes = [(v, {n: (1.0 if n == v else 0.3 if kinds[n] == "voice" else 0.5)
@@ -430,7 +465,7 @@ def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codec
                 wav = tmp / "rehearsal.wav"
                 mid.write_bytes(mix_tracks(movs, programs, gains))
                 synth.render_wav(fluidsynth, soundfont, mid, wav)
-                dest = outdir / f"{stem} - {label}.mp3"
+                dest = outdir / _safe_name(f"{stem} - {label}", ".mp3")
                 synth.encode(ffmpeg, wav, {"mp3": dest}, codecs, end_s)
                 report["rehearsal"][label] = str(dest)
                 downloads.append((label, dest.name))
@@ -447,16 +482,16 @@ def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codec
 
         if not a.no_viewer:
             log.step("Writing the play-along page")
-            needs: dict[int, set[int]] = {}
+            needs: dict[int, dict[int, float]] = {}
             for n, ns in track_notes(movs).items():
                 progs = {52, 0} if kinds[n] == "voice" else {programs[n]}
                 for prog in progs:
-                    needs.setdefault(prog, set()).update(int(x[2]) for x in ns)
+                    per = needs.setdefault(prog, {})
+                    for x in ns:
+                        per[int(x[2])] = max(per.get(int(x[2]), 0.0), (x[1] - x[0]) / 1000)
             link = a.link_audio
             sheet = (outdir if link else tmp) / f"{stem}.samples.mp3"
             layout = synth.render_sample_sheet(fluidsynth, ffmpeg, soundfont, needs, sheet, tmp)
-            if link:
-                report["samples"] = str(sheet)
             silent = tmp / "silent.mp3"
             synth.silent_mp3(ffmpeg, silent)
             html_path = outdir / f"{stem}.html"
@@ -465,6 +500,9 @@ def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codec
                             programs={n: programs[n] for n in names}, downloads=downloads)
             write_viewer(html_path, stem, movs, player, notes, end_s, embed_audio=not link)
             report["viewer"] = str(html_path)
+            if link:
+                sheet.unlink(missing_ok=True)  # the page reads the .js copy
+                report["samples"] = str(sheet.with_suffix(".js"))
 
     report["notes"] = notes
     report["status"] = "done"
@@ -485,17 +523,32 @@ def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codec
                Path(report.get("video", "")).name)
 
 
+def _safe_name(base: str, suffix: str) -> str:
+    """A file name without path separators that fits the 255-byte limit, even
+    with the '.<name>.partial' wrapping used while writing."""
+    base = re.sub(r'[/\\:\x00-\x1f]', "-", base).strip() or "part"
+    room = 255 - len(".partial") - len(suffix) - 1
+    if len(base.encode("utf-8")) > room:
+        digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:8]
+        cut = base.encode("utf-8")[: room - 9].decode("utf-8", "ignore")
+        base = f"{cut}~{digest}"
+    return base + suffix
+
+
 def _write_report(outdir: Path, report: dict) -> None:
     (outdir / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False))
 
 
 def _print_summary(report: dict, notes: list[str], xml_paths: list[Path]) -> None:
     print(f"\nDone. Output folder: {report['outdir']}")
-    rows = [("viewer", report.get("viewer")), ("video", report.get("video")),
-            ("midi", report.get("midi"))] + list(report["audio"].items())
+    rows = [("viewer", report.get("viewer")), ("samples", report.get("samples")),
+            ("video", report.get("video")), ("midi", report.get("midi"))]
+    rows += list(report["audio"].items())
+    rows += [("part", v) for v in (report.get("rehearsal") or {}).values()]
     for key, path in rows:
         if path:
-            print(f"  {key:8s} {Path(path).name}")
+            extra = "   (the page needs it: keep it next to the .html)" if key == "samples" else ""
+            print(f"  {key:8s} {Path(path).name}{extra}")
     if "video" in report:
         print("\n  The .mp4 plays on an iPhone/iPad in Photos or Files (AirDrop it over).")
     if notes:

@@ -121,24 +121,38 @@ SUSTAINED = set(range(16, 24)) | set(range(40, 56)) | set(range(56, 80)) | set(r
 _PRE_S = 0.05
 
 
-def sample_sheet_midi(needs: dict[int, set[int]]) -> tuple[bytes, dict[str, dict[str, list]]]:
+def sample_sheet_midi(needs: dict[int, dict[int, float]]
+                      ) -> tuple[bytes, dict[str, dict[str, list]], list[tuple[float, float]]]:
     """A MIDI file that plays every needed (program, pitch) once, one after the
     other, and where each sample sits in the rendered audio:
     {program: {pitch: [start s, length s, loop start s, loop end s]}} (loop
-    points only for sustaining programs)."""
+    points only for sustaining programs). `needs` maps program -> pitch ->
+    longest note in seconds; non-sustaining samples are held that long at
+    half speed (3.6-12 s). Also returns the loop regions (start, end), whose
+    seams render_sample_sheet smooths."""
+    import io
+
     import mido
 
     tpb, ticks_per_s = 960, 1920
     events = []
     layout: dict[str, dict[str, list]] = {}
+    loops: list[tuple[float, float]] = []
     channels = [c for c in range(16) if c != 9]
     t = 0.0
     for k, (prog, pitches) in enumerate(sorted(needs.items())):
         ch = channels[k % len(channels)]
-        events.append((0, 0, mido.Message("program_change", channel=ch, program=prog)))
+        # At the start of this program's block: channels get reused by later
+        # programs, which is safe because the blocks follow one another.
+        events.append((int(t * ticks_per_s), 0, mido.Message("program_change", channel=ch,
+                                                              program=prog)))
         sustained = prog in SUSTAINED
-        hold, window = (6.0, 6.6) if sustained else (3.6, 4.4)
         for pitch in sorted(pitches):
+            if sustained:
+                hold, window = 6.0, 6.6
+            else:
+                hold = min(12.0, max(3.6, 2 * pitches[pitch] + 0.3))
+                window = hold + 0.8
             on = t + _PRE_S
             events.append((int(on * ticks_per_s), 2, mido.Message("note_on", channel=ch,
                                                                    note=pitch, velocity=90)))
@@ -147,6 +161,7 @@ def sample_sheet_midi(needs: dict[int, set[int]]) -> tuple[bytes, dict[str, dict
             entry = [round(on, 4), round(window - _PRE_S - 0.05, 4)]
             if sustained:
                 entry += [round(on + 1.5, 4), round(on + 5.5, 4)]
+                loops.append((on + 1.5, on + 5.5))
             layout.setdefault(str(prog), {})[str(pitch)] = entry
             t += window
     events.sort(key=lambda e: (e[0], e[1]))
@@ -159,21 +174,50 @@ def sample_sheet_midi(needs: dict[int, set[int]]) -> tuple[bytes, dict[str, dict
         tr.append(msg.copy(time=tick - now))
         now = tick
     tr.append(mido.MetaMessage("end_of_track", time=ticks_per_s))
-    import io
-
     buf = io.BytesIO()
     mf.save(file=buf)
-    return buf.getvalue(), layout
+    return buf.getvalue(), layout, loops
+
+
+_SEAM_S = 0.1
+
+
+def _smooth_loops(wav: Path, loops: list[tuple[float, float]]) -> None:
+    """Crossfade the end of each loop region into the audio just before its
+    start, so looping from loop end back to loop start has no click."""
+    import array
+    import wave
+
+    with wave.open(str(wav), "rb") as w:
+        params = w.getparams()
+        frames = array.array("h", w.readframes(params.nframes))
+    ch, rate = params.nchannels, params.framerate
+    fade = int(_SEAM_S * rate)
+    for start, end in loops:
+        s0, e0 = int(start * rate), int(end * rate)
+        if s0 - fade < 0 or e0 > params.nframes:
+            continue
+        for i in range(fade):
+            g = i / fade  # 0 -> 1 across the seam
+            a = (e0 - fade + i) * ch
+            b = (s0 - fade + i) * ch
+            for c in range(ch):
+                v = frames[a + c] * (1 - g) + frames[b + c] * g
+                frames[a + c] = max(-32768, min(32767, int(v)))
+    with wave.open(str(wav), "wb") as w:
+        w.setparams(params)
+        w.writeframes(frames.tobytes())
 
 
 def render_sample_sheet(fluidsynth: Path, ffmpeg: Path, soundfont: Path,
-                        needs: dict[int, set[int]], dest: Path, tmp: Path) -> dict:
+                        needs: dict[int, dict[int, float]], dest: Path, tmp: Path) -> dict:
     """Render the sample sheet to a mono MP3 (`dest`); returns its layout."""
-    midi, layout = sample_sheet_midi(needs)
+    midi, layout, loops = sample_sheet_midi(needs)
     mid = tmp / "samples.mid"
     wav = tmp / "samples.wav"
     mid.write_bytes(midi)
     render_wav(fluidsynth, soundfont, mid, wav)
+    _smooth_loops(wav, loops)
     peak = peak_db(ffmpeg, wav)
     gain = 0.0 if peak is None else PEAK_TARGET_DB - peak
     part = partial_name(dest)

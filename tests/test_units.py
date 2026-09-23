@@ -671,3 +671,144 @@ def test_music_read_into_the_wrong_voice_part_is_moved_back():
     p1, p3 = root.findall("part")[0], root.findall("part")[2]
     assert p1.findall("measure")[2].find("note/pitch") is not None
     assert p3.findall("measure")[2].find("note/rest") is not None
+
+
+# ---------------------------------------------------------------- choral review regressions
+
+
+def _voices(staves: list[tuple[str, str, str, list[str]]], program: int = 54) -> bytes:
+    """Single-staff parts: (label, clef sign, clef line, bars of MusicXML notes)."""
+    parts, plist = [], []
+    for k, (label, sign, line, bars) in enumerate(staves, 1):
+        oct_ = "<clef-octave-change>-1</clef-octave-change>" if sign == "G8" else ""
+        sgn = "G" if sign == "G8" else sign
+        attr = (f'<attributes><divisions>2</divisions><time><beats>3</beats><beat-type>4</beat-type></time>'
+                f'<clef><sign>{sgn}</sign><line>{line}</line>{oct_}</clef></attributes>')
+        plist.append(f'<score-part id="P{k}"><part-name>{label}</part-name>'
+                     f'<midi-instrument id="P{k}-I1"><midi-program>{program}</midi-program></midi-instrument></score-part>')
+        parts.append(f'<part id="P{k}">' + "".join(
+            f'<measure number="{i}">{attr if i == 1 else ""}{b}</measure>' for i, b in enumerate(bars, 1)) + "</part>")
+    return ('<?xml version="1.0" encoding="UTF-8"?><score-partwise version="4.0"><part-list>'
+            + "".join(plist) + "</part-list>" + "".join(parts) + "</score-partwise>").encode()
+
+
+def _q(step, octv, chord=False, voice="1"):
+    return note(step, octv, 2, "quarter", voice=voice, chord=chord)
+
+
+BAR = lambda step, octv: _q(step, octv) * 3  # noqa: E731
+
+
+def _names(xml: bytes, parts=None) -> list[str]:
+    return [t.name for t in render_musicxml(xml, "t", parts_names=parts).tracks]
+
+
+def test_a_tempo_does_not_name_a_part_and_ttbb_gets_ttbb_names():
+    tempo = '<direction><direction-type><words>a tempo</words></direction-type></direction>'
+    satb = _voices([("Voice", "G", "2", [tempo + BAR("E", 5)]), ("Voice", "G", "2", [BAR("C", 5)]),
+                    ("Voice", "G8", "2", [BAR("G", 3)]), ("Voice", "F", "4", [BAR("C", 3)])])
+    assert _names(satb) == ["Soprano", "Alto", "Tenor", "Bass"]
+    ttbb = _voices([("Voice", "G8", "2", [BAR("E", 4)]), ("Voice", "G8", "2", [BAR("C", 4)]),
+                    ("Voice", "F", "4", [BAR("G", 3)]), ("Voice", "F", "4", [BAR("C", 3)])])
+    assert _names(ttbb) == ["Tenor 1", "Tenor 2", "Bass 1", "Bass 2"]
+
+
+def test_label_decides_whether_a_staff_is_split():
+    divisi = _q("E", 5) + _q("C", 5, chord=True) + _q("D", 5) + _q("E", 5)
+    unison = BAR("C", 5)
+    one = _voices([("Soprano", "G", "2", [divisi, unison]), ("Alto", "G", "2", [unison, unison])])
+    assert _names(one) == ["Soprano", "Alto"]  # divisi stays inside the Soprano part
+    two = _voices([("Soprano/Alto", "G", "2", [unison, unison]), ("Tenor/Bass", "F", "4", [BAR("C", 3)] * 2)])
+    assert _names(two) == ["Soprano", "Alto", "Tenor", "Bass"]  # mostly unison, still two parts each
+    s12 = _voices([("Soprano 1/2", "G", "2", [divisi, divisi]), ("Alto", "G", "2", [unison, unison])])
+    assert _names(s12) == ["Soprano 1", "Soprano 2", "Alto"]
+
+
+def test_resting_voice_on_a_two_voice_staff_gets_nothing():
+    rest3 = '<note><rest/><duration>6</duration><voice>2</voice><type>half</type><dot/><staff>1</staff></note>'
+    bar1 = BAR("E", 5) + backup(6) + _q("C", 5, voice="2") * 3
+    bar2 = BAR("G", 5) + backup(6) + rest3  # the alto rests
+    r = render_musicxml(_voices([("Soprano/Alto", "G", "2", [bar1, bar2])]), "t", parts_names=None)
+    alto = next(t for t in r.tracks if t.name == "Alto")
+    assert _pitches(alto.midi) == [72, 72, 72]
+
+
+def test_instrument_names_with_voice_words_are_instruments():
+    xml = _voices([("Soprano", "G", "2", [BAR("E", 5)]), ("Bassoon", "F", "4", [BAR("C", 3)])],
+                  program=70)
+    r = render_musicxml(xml, "t", parts_names=None)
+    kinds = {t.name: t.kind for t in r.tracks}
+    assert kinds.get("Bassoon") == "instrument"
+
+
+def test_given_names_count_resting_staff_groups_too():
+    rest3 = '<note><rest/><duration>6</duration><voice>1</voice><type>half</type><dot/><staff>1</staff></note>'
+    xml = _voices([("Voice", "G", "2", [rest3]), ("Voice", "G", "2", [BAR("C", 5)]),
+                   ("Voice", "F", "4", [BAR("C", 3)])])
+    assert _names(xml, ["Solo", "Choir sopranos", "Men"]) == ["Choir sopranos", "Tenor", "Bass"]
+
+
+def test_hymn_on_a_grand_staff_can_be_named_as_four_voices():
+    hymn = score([FULL5] * 2)
+    assert _names(hymn) == ["Right hand", "Left hand"]
+    assert _names(hymn, ["Soprano/Alto/Tenor/Bass"])[:4] == ["Soprano", "Alto", "Tenor", "Bass"]
+
+
+def test_bar_lines_are_left_alone_when_counts_match_or_totals_differ():
+    # Same number of bars, one short: a short bar (repair's job), not a missed bar line.
+    xml = _voices([("A", "G", "2", [BAR("C", 5)] * 3), ("B", "G", "2", [BAR("C", 5), _q("C", 5), BAR("C", 5)])])
+    root = root_of(xml)
+    assert not any("disagreed" in n for n in sanitize(root))
+    assert [len(p.findall("measure")) for p in root.findall("part")] == [3, 3]
+
+
+def test_meter_run_always_switches_back():
+    four = _q("C", 5) * 4
+    two = _q("C", 5) * 2
+    xml = _voices([("A", "G", "2", [BAR("C", 5)] * 3 + [four] * 3 + [two] + [BAR("C", 5)] * 2)])
+    root = root_of(xml)
+    mx.repair(root, _heard_from_root)
+    times = [(m.get("number"), m.findtext("attributes/time/beats"))
+             for m in root.iter("measure") if m.find("attributes/time") is not None]
+    assert times == [("1", "3"), ("4", "4"), ("7", "3")]
+
+
+def test_missed_rests_elsewhere_prevent_an_invented_meter():
+    short = _q("C", 5) * 2
+    xml = _voices([("A", "G", "2", [BAR("C", 5), short, BAR("C", 5), short, short, short, BAR("C", 5)])])
+    root = root_of(xml)
+    rep = mx.repair(root, _heard_from_root)
+    assert len([m for m in root.iter("measure") if m.find("attributes/time") is not None]) == 1
+    assert rep.padded == ["2", "4", "5", "6"]
+
+
+def test_sample_sheet_sets_each_program_at_its_block_and_holds_long_piano_notes():
+    from sheet2audio.synth import sample_sheet_midi
+    needs = {p: {60: 1.0} for p in range(18)}
+    needs[0] = {60: 5.0}
+    midi, layout, loops = sample_sheet_midi(needs)
+    t, prog_at = 0.0, {}
+    current = {}
+    for m in mido.MidiFile(file=io.BytesIO(midi)):
+        t += m.time
+        if m.type == "program_change":
+            current[m.channel] = m.program
+        elif m.type == "note_on" and m.velocity:
+            prog_at[round(t, 2)] = current[m.channel]
+    for prog, pitches in layout.items():
+        assert prog_at[round(pitches["60"][0], 2)] == int(prog)
+    assert layout["0"]["60"][1] > 10  # a 5 s note at half speed needs ~10 s of sample
+    assert loops and all(b - a == 4.0 for a, b in loops)
+
+
+def test_mix_tracks_with_many_parts_never_mixes_sounds_on_a_channel():
+    from sheet2audio.render import TrackAudio, mix_tracks
+    r = render_musicxml(score([FULL5]), "t", parts_names=None)
+    base = r.tracks[0]
+    r.tracks = [TrackAudio(f"P{i}", "voice", 0, base.ids, base.midi) for i in range(20)]
+    programs = {f"P{i}": (52 if i % 2 else 0) for i in range(20)}
+    out = mido.MidiFile(file=io.BytesIO(mix_tracks([(r, 0.0)], programs, {})))
+    chan_prog = {}
+    for m in out:
+        if m.type == "program_change":
+            assert chan_prog.setdefault(m.channel, m.program) == m.program

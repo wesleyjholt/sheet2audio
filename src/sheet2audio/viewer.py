@@ -86,6 +86,15 @@ def write_viewer(
     }
     # `</` inside a <script> block would end it early; `<\/` is the same JSON string.
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
-    values = {"TITLE": html.escape(title), "DATA": payload}
-    page = re.sub(r"__(TITLE|DATA)__", lambda m: values[m.group(1)], template)
+    script = ""
+    if not embed_audio:
+        # The sounds live in '<name>.js' next to the page: a script tag loads
+        # it from disk as well as over the network (fetch() cannot read
+        # file:// pages' neighbours).
+        js = player.samples.with_suffix(".js")
+        js.write_text("window.__sheet2audioSamples = " + json.dumps(_src(player.samples, True))
+                      + ";\n", encoding="utf-8")
+        script = f'<script src="{html.escape(urllib.parse.quote(js.name), quote=True)}"></script>'
+    values = {"TITLE": html.escape(title), "DATA": payload, "SAMPLES_SCRIPT": script}
+    page = re.sub(r"__(TITLE|DATA|SAMPLES_SCRIPT)__", lambda m: values[m.group(1)], template)
     dest.write_text(page, encoding="utf-8")

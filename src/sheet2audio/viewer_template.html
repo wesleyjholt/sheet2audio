@@ -105,6 +105,7 @@
 </main>
 <footer>Tap a note to jump there. Space bar plays and pauses. Made with Audiveris, Verovio and FluidSynth.</footer>
 <script type="application/json" id="data">__DATA__</script>
+__SAMPLES_SCRIPT__
 <script>
 (function () {
   "use strict";
@@ -221,7 +222,7 @@
       ev.on.forEach(function (k) {
         active.set(k, (active.get(k) || 0) + 1);
         paint(k);
-        if (!lead && lit(k) && byId.get(k)) lead = byId.get(k);
+        if (lit(k) && byId.get(k)) lead = byId.get(k);
       });
     }
     lastT = tms;
@@ -247,7 +248,7 @@
   var LOOKAHEAD_S = 0.3, TICK_MS = 40;
   var wakeLock = null;
 
-  function now() { return playing ? pos0 + (ctx.currentTime - t0) * 1000 * rate : pos0; }
+  function now() { return playing ? Math.max(pos0, pos0 + (ctx.currentTime - t0) * 1000 * rate) : pos0; }
   function setStatus(t) { $("status").textContent = t || ""; }
 
   function ensureAudio() {
@@ -265,7 +266,8 @@
       return g;
     });
     setStatus("Loading sounds…");
-    loading = fetch(data.samples.src).then(function (r) { return r.arrayBuffer(); })
+    var src = window.__sheet2audioSamples || data.samples.src;
+    loading = fetch(src).then(function (r) { return r.arrayBuffer(); })
       .then(function (buf) {
         return new Promise(function (res, rej) { ctx.decodeAudioData(buf, res, rej); });
       })
@@ -281,6 +283,8 @@
       silent = new Audio(data.silent_src);
       silent.loop = true;
       silent.setAttribute("playsinline", "");
+    }
+    if (silent && silent.paused) {
       var p = silent.play();
       if (p && p.catch) p.catch(function () {});
     }
@@ -340,7 +344,10 @@
     var horizon = now() + LOOKAHEAD_S * 1000 * rate;
     for (var i = 0; i < tracks.length; i++) {
       var ns = tracks[i].notes;
-      while (ptr[i] < ns.length && ns[ptr[i]][0] < horizon) { startNote(i, ns[ptr[i]], ns[ptr[i]][0]); ptr[i]++; }
+      while (ptr[i] < ns.length && ns[ptr[i]][0] < horizon) {
+        startNote(i, ns[ptr[i]], Math.max(ns[ptr[i]][0], now()));
+        ptr[i]++;
+      }
     }
     var t = ctx.currentTime;
     if (live.length > 400) live = live.filter(function (v) { return v.end > t; });
@@ -393,6 +400,7 @@
     playing = false;
     silenceAll();
     setPlayUI(false);
+    if (silent) silent.pause();
     if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
   }
   function seekTo(ms) {

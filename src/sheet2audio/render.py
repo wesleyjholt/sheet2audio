@@ -14,6 +14,7 @@ import io
 import multiprocessing
 import re
 import signal
+import xml.etree.ElementTree as ET
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
@@ -214,7 +215,7 @@ def _midi_extent(data: bytes) -> tuple[float, float, int]:
 
 def render_musicxml(xml: bytes, title: str, bpm: float | None = None, tempo_scale: float = 1.0,
                     layout: str = "encoded", video: bool = False,
-                    parts_names: list[str] | bool | None = False) -> Rendered:
+                    parts_names: list[str] | bool | None = False, hands: bool = True) -> Rendered:
     """Engrave and time `xml`. With `bpm`, the score's first tempo becomes
     `bpm` and later tempo changes keep their ratio; otherwise every tempo is
     multiplied by `tempo_scale`. The tempo is applied here, not by Verovio,
@@ -222,8 +223,13 @@ def render_musicxml(xml: bytes, title: str, bpm: float | None = None, tempo_scal
     text = xml.decode("utf-8")
     warnings: list[str] = []
     tk = _toolkit(_options(DESKTOP, layout), text)
+    part_entries: list[str] | None = None
     if parts_names is not False:
-        relabeled = _label_parts(text, tk.getMEI(), parts_names or None)
+        from . import parts as _parts
+
+        plans = _parts.plan_groups(ET.fromstring(tk.getMEI()), parts_names or None, warnings)
+        part_entries = [p.entry for p in plans]
+        relabeled = _label_parts(text, plans)
         if relabeled != text:
             text = relabeled
             tk = _toolkit(_options(DESKTOP, layout), text)
@@ -251,7 +257,7 @@ def render_musicxml(xml: bytes, title: str, bpm: float | None = None, tempo_scal
 
     tracks = []
     if parts_names is not False:
-        tracks = _tracks(tk.getMEI(), parts_names or None, warnings)
+        tracks = _tracks(tk.getMEI(), part_entries, hands, warnings)
     duration, ring, notes = _midi_extent(midi)
     # The last note starts at the same moment in the MIDI and in the timemap,
     # unless something (e.g. an absurd tempo) broke the MIDI timing.
@@ -270,31 +276,21 @@ def render_musicxml(xml: bytes, title: str, bpm: float | None = None, tempo_scal
     )
 
 
-def _label_parts(text: str, mei: str, names: list[str] | None) -> str:
+def _label_parts(text: str, plans) -> str:
     """Name the staves after the parts found (e.g. 'Soprano/Alto' instead of
     the 'Voice' OMR wrote), where the score's own names are generic."""
-    import xml.etree.ElementTree as ET
-
     from . import parts
 
-    tracks = parts.find_tracks(mei, names)
     root = ET.fromstring(text.encode("utf-8"))
-    score_parts = {sp.get("id"): sp for sp in root.iter("score-part")}
-    n = 0
+    score_parts = [root.find(f".//score-part[@id='{p.get('id')}']") for p in root.findall("part")]
     changed = False
-    for part in root.findall("part"):
-        staves = part.findtext("measure/attributes/staves")
-        count = int(staves) if staves and staves.strip().isdigit() else 1
-        mine = [str(k) for k in range(n + 1, n + count + 1)]
-        n += count
-        sp = score_parts.get(part.get("id"))
-        if sp is None:
+    for sp, plan in zip(score_parts, plans):
+        if sp is None or plan.kind != "voice":
             continue
         current = (sp.findtext("part-name") or "").strip()
         if current and not parts.is_generic_name(current):
             continue
-        label = "/".join(dict.fromkeys(t.name for t in tracks if set(t.staves) <= set(mine)
-                                       and t.kind == "voice"))
+        label = "/".join(n for s in plan.group.staves for n in plan.names.get(s, []))
         if not label:
             continue
         for tag, value in (("part-name", label),
@@ -309,13 +305,14 @@ def _label_parts(text: str, mei: str, names: list[str] | None) -> str:
     return ET.tostring(root, encoding="unicode", xml_declaration=True)
 
 
-def _tracks(mei: str, names: list[str] | None, warnings: list[str]) -> list[TrackAudio]:
+def _tracks(mei: str, names: list[str] | None, hands: bool,
+            warnings: list[str]) -> list[TrackAudio]:
     """Each part's own MIDI, rendered from the MEI with the other parts' notes
     replaced by silence (so all parts share the score's time line)."""
     from . import parts
 
     out = []
-    for t in parts.find_tracks(mei, names):
+    for t in parts.find_tracks(mei, names, hands=hands):
         tk = _toolkit(_options(DESKTOP, "auto"), parts.isolate(mei, t))
         out.append(TrackAudio(t.name, t.kind, t.program, sorted(t.ids),
                               base64.b64decode(tk.renderToMIDI())))
@@ -334,7 +331,8 @@ class MovementJob:
     tempo_scale: float
     layout: str
     video: bool
-    parts: list[str] | None = None  # part names given by the user, one per staff group
+    parts: list[str] | None = None  # part names, one entry per staff group
+    hands: bool = True  # a piano-only piece may be split into right and left hand
 
 
 @dataclass
@@ -349,12 +347,38 @@ def process_movement(job: MovementJob) -> MovementResult:
     report = musicxml.repair(root, _heard_from_root, apply=job.repair)
     xml = musicxml.to_bytes(root)
     r = render_musicxml(xml, job.title, bpm=job.bpm, tempo_scale=job.tempo_scale,
-                        layout=job.layout, video=job.video, parts_names=job.parts or None)
+                        layout=job.layout, video=job.video, parts_names=job.parts or None,
+                        hands=job.hands)
     return MovementResult(xml=r.xml or xml, rendered=r, notes=report.notes)
 
 
 def _ignore_sigint() -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def describe_parts(xml: bytes) -> list[tuple[str, str, bool]]:
+    """(--parts entry, kind, has notes) for each staff group of a movement."""
+    from . import parts
+
+    tk = _toolkit(_options(DESKTOP, "auto"), xml.decode("utf-8"))
+    return parts.describe_groups(tk.getMEI())
+
+
+def in_children(fn, args: list, what: str = "reading the score") -> list:
+    """Run fn over args in child processes (Verovio crashes cannot kill us)."""
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=max(1, min(4, len(args))), mp_context=ctx,
+                             initializer=_ignore_sigint) as pool:
+        old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            futures = [pool.submit(fn, a) for a in args]
+        finally:
+            signal.signal(signal.SIGINT, old)
+        try:
+            return [f.result() for f in futures]
+        except BrokenProcessPool:
+            raise RenderError(f"The engraving step stopped unexpectedly while {what} (Verovio "
+                              "probably crashed on something in the MusicXML).") from None
 
 
 def process_movements(jobs: list[MovementJob], workers: int = 4) -> list[MovementResult]:
@@ -479,10 +503,17 @@ def mix_tracks(movements: list[tuple[Rendered, float]], programs: dict[str, int]
     """One MIDI file with every part on its own channel, with the given General
     MIDI program and volume (0-1, as amplitude; 0 leaves the part out)."""
     names = [n for n in track_names([r for r, _ in movements]) if gains.get(n, 1.0) > 0]
-    channel = {n: _CHANNELS[i % len(_CHANNELS)] for i, n in enumerate(names)}
+    if len(names) <= len(_CHANNELS):
+        channel = {n: _CHANNELS[i] for i, n in enumerate(names)}
+    else:
+        # More parts than MIDI channels: parts that sound the same (program
+        # and volume) share a channel; nothing else ever does unless forced.
+        keys = list(dict.fromkeys((programs.get(n, 0), gains.get(n, 1.0)) for n in names))
+        channel = {n: _CHANNELS[keys.index((programs.get(n, 0), gains.get(n, 1.0)))
+                                % len(_CHANNELS)] for n in names}
     events: list[tuple[int, int, int, mido.Message]] = []
     seq = 0
-    for n, ch in channel.items():
+    for n, ch in dict(reversed(list(channel.items()))).items():  # first part wins a shared channel
         # MIDI volume is a power curve: amplitude g -> value 127 * sqrt(g).
         vol = max(0, min(127, round(127 * gains.get(n, 1.0) ** 0.5)))
         for msg in (mido.Message("program_change", channel=ch, program=programs.get(n, 0)),
@@ -539,4 +570,23 @@ def track_notes(movements: list[tuple[Rendered, float]]) -> dict[str, list[list[
                         held = []
                     pedal_down = down
             notes.sort()
+    for name, notes in out.items():
+        # The same pitch twice at the same moment in one part (e.g. a chord
+        # that doubles a note) sounds once, as it does in the MIDI.
+        merged: dict[tuple[float, float, int], list[float]] = {}
+        for n in notes:
+            key = (n[0], n[1], n[2])
+            if key in merged:
+                merged[key][3] = max(merged[key][3], n[3])
+            else:
+                merged[key] = n
+        out[name] = sorted(merged.values())
     return out
+
+
+def channels_needed(movements: list[Rendered], programs: dict[str, int]) -> int:
+    """How many distinct MIDI channels the full mix would need."""
+    names = track_names(movements)
+    if len(names) <= len(_CHANNELS):
+        return len(names)
+    return len({programs.get(n, 0) for n in names})
