@@ -86,28 +86,43 @@
     document.getElementById("notes").appendChild(d);
   }
 
-  // Lay out the engraved pages. Verovio's ids are unique within one movement,
-  // so each movement's ids are prefixed with its index.
+  // Lay out the engraved pages: the original line breaks on wide screens, a
+  // re-flowed layout on phones. Both use the same note ids. Verovio's ids are
+  // unique within one movement, so each is prefixed with the movement index.
   var score = document.getElementById("score");
   var byId = new Map();
-  data.movements.forEach(function (mv, mi) {
-    if (data.movements.length > 1) {
-      var h = document.createElement("h2");
-      h.textContent = mv.title;
-      score.appendChild(h);
-    }
-    mv.svgs.forEach(function (svg) {
-      var div = document.createElement("div");
-      div.className = "page";
-      div.innerHTML = svg;
-      div.querySelectorAll("[data-id]").forEach(function (el) {
-        var key = mi + ":" + el.getAttribute("data-id");
-        el.setAttribute("data-key", key);
-        byId.set(key, el);
+  var narrowQuery = window.matchMedia("(max-width: 700px)");
+  var layout = null;
+  function build() {
+    var want = narrowQuery.matches ? "svgs_narrow" : "svgs";
+    if (want === layout) return;
+    layout = want;
+    score.innerHTML = "";
+    byId = new Map();
+    data.movements.forEach(function (mv, mi) {
+      if (data.movements.length > 1) {
+        var h = document.createElement("h2");
+        h.textContent = mv.title;
+        score.appendChild(h);
+      }
+      (mv[want] && mv[want].length ? mv[want] : mv.svgs).forEach(function (svg) {
+        var div = document.createElement("div");
+        div.className = "page";
+        div.innerHTML = svg;
+        div.querySelectorAll("[data-id]").forEach(function (el) {
+          var key = mi + ":" + el.getAttribute("data-id");
+          el.setAttribute("data-key", key);
+          byId.set(key, el);
+        });
+        score.appendChild(div);
       });
-      score.appendChild(div);
     });
-  });
+    if (typeof active !== "undefined") {
+      active.forEach(function (_, key) { var el = byId.get(key); if (el) el.classList.add("playing"); });
+    }
+  }
+  build();
+  if (narrowQuery.addEventListener) narrowQuery.addEventListener("change", build);
 
   // One global, time-sorted event list across movements.
   var events = [];

@@ -6,6 +6,7 @@ import base64
 import html
 import json
 import re
+import urllib.parse
 from importlib.resources import files
 from pathlib import Path
 
@@ -30,6 +31,7 @@ def write_viewer(
             {
                 "title": r.title,
                 "svgs": r.svgs,
+                "svgs_narrow": r.svgs_narrow,
                 "timemap": [
                     {k: e[k] for k in ("tstamp", "on", "off", "measureOn") if k in e}
                     for e in r.timemap
@@ -45,7 +47,7 @@ def write_viewer(
         mime = MIME.get(audio.suffix.lower(), "application/octet-stream")
         src = f"data:{mime};base64," + base64.b64encode(audio.read_bytes()).decode("ascii")
     else:
-        src = html.escape(audio.name, quote=True)
+        src = html.escape(urllib.parse.quote(audio.name), quote=True)
     values = {"TITLE": html.escape(title), "AUDIO_SRC": src, "DATA": payload}
     page = re.sub(r"__(TITLE|AUDIO_SRC|DATA)__", lambda m: values[m.group(1)], template)
     dest.write_text(page, encoding="utf-8")

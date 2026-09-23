@@ -139,3 +139,11 @@ def find_musescore() -> Path | None:
         if w:
             return Path(w)
     return None
+
+
+def find_rsvg() -> Path | None:
+    """librsvg's rsvg-convert (LGPL-2.1+), used to draw the video frames."""
+    try:
+        return find_executable("rsvg-convert", "")
+    except MissingTool:
+        return None
