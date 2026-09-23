@@ -92,6 +92,7 @@ The output goes to `my-piece_sheet2audio/`, next to the PDF:
 uv run sheet2audio piece.pdf --bpm 80            # starting tempo (quarter notes/minute)
 uv run sheet2audio piece.pdf --tempo-scale 0.75  # 75 % of the printed tempo
 uv run sheet2audio piece.pdf --time 3/4          # time signature, if none was recognised
+uv run sheet2audio piece.pdf --key 29:C          # a key change OMR missed (29:C,41:Eb; Am for minor)
 uv run sheet2audio piece.pdf --sheets "1 3-4"    # only some pages
 uv run sheet2audio piece.pdf --formats mp3,m4a,flac
 uv run sheet2audio piece.pdf --no-video          # faster; skip the MP4
@@ -128,6 +129,7 @@ What the tool does about common recognition errors:
 - **Too-short bars.** If a bar plays shorter than its time signature (usually a missed rest), a rest is added and the bar is named for you to check. Pickups, bars split by a repeat, and short bars that complete a pickup at a repeat are left alone.
 - **Repeats.** Repeats drawn as ":\|\|:" and "A :\| B :\|" are made to play in the order a pianist would.
 - **Recognition debris.** Stray 8va marks and empty bars from courtesy signatures are removed, and you are told where.
+- **Dropped key changes.** Audiveris recognises a key change made of natural signs (e.g. B-flat major → C major) but leaves it out of its MusicXML. The key is read back from the Audiveris book, and the notes after it are re-spelled. For other misses, use `--key`.
 - **Tempo written as text.** Something like "= 132" is used as the tempo.
 - **Several pieces on one page** are split, each with its own tempo.
 

@@ -836,3 +836,73 @@ def test_audiveris_lyric_numbers_follow_the_lines_on_the_page():
     mx._renumber_lyrics(root)  # applied to Audiveris output only
     nums = [l.get("number") for l in root.iter("lyric")]
     assert nums == ["1", "1", "1", "1", "2", "1", "2", "1", "2"]
+
+
+def _flat_note(step, octave, alter=None, acc=None, tie=None, dur=2):
+    a = f"<alter>{alter}</alter>" if alter is not None else ""
+    t = f'<tie type="{tie}"/>' if tie else ""
+    x = f"<accidental>{acc}</accidental>" if acc else ""
+    return (f"<note><pitch><step>{step}</step>{a}<octave>{octave}</octave></pitch>"
+            f"<duration>{dur}</duration>{t}<voice>1</voice><type>quarter</type>{x}"
+            f"<staff>1</staff></note>")
+
+
+def _spelled(root, bar):
+    out = []
+    for n in root.find("part").findall("measure")[bar].findall("note"):
+        p = n.find("pitch")
+        out.append(p.findtext("step") + {"1": "#", "-1": "b"}.get(p.findtext("alter") or "", ""))
+    return out
+
+
+def test_book_key_change_is_restored_and_notes_respelled(tmp_path):
+    import zipfile
+
+    from sheet2audio.omr import book_keys
+    # Two flats until bar 3, where Audiveris read a cancellation it did not export.
+    two_flats = ATTR.replace("<fifths>0</fifths>", "<fifths>-2</fifths>")
+    bars = [
+        _flat_note("B", 4, -1) + _flat_note("E", 5, -1) + _flat_note("A", 4),
+        _flat_note("B", 4, -1) + _flat_note("E", 5, -1, tie="start"),
+        _flat_note("E", 5, -1, tie="stop") + _flat_note("B", 4, -1) + _flat_note("E", 5, -1),
+        _flat_note("B", 4, -1, acc="flat") + _flat_note("B", 4, -1) + _flat_note("B", 3, -1),
+    ]
+    xml = score(bars).replace(ATTR.format(beats=3).encode(), two_flats.format(beats=3).encode())
+    xml = xml.replace(b'<measure number="3">', b'<measure number="3"><print new-system="yes"/>')
+    sheet = ('<sheet><page id="1"><system id="1"><stack id="1" left="100" right="500"/>'
+             '<stack id="2" left="500" right="900"/><sig><key fifths="-2" staff="1">'
+             '<bounds x="120" y="0" w="10" h="10"/></key></sig></system>'
+             '<system id="2"><stack id="3" left="100" right="500"/>'
+             '<stack id="4" left="500" right="900"/><stack id="4" left="900" right="950" '
+             'special="CAUTIONARY"/><sig><key shape="KEY_CANCEL" staff="1">'
+             '<bounds x="120" y="0" w="10" h="10"/></key>'
+             '<key fifths="3" staff="1"><bounds x="910" y="0" w="10" h="10"/></key>'
+             '</sig></system></page></sheet>')
+    book = tmp_path / "b.omr"
+    with zipfile.ZipFile(book, "w") as z:
+        z.writestr("sheet#1/sheet#1.xml", sheet)
+    keys = book_keys(book)
+    # The cautionary key at the end of the line is not a change in bar 4.
+    assert [(k.page, k.measure, k.fifths) for k in keys] == [(0, 0, -2), (0, 2, 0)]
+    root = mx.parse(xml)
+    notes = mx.apply_book_keys([root], keys)
+    assert len(notes[0]) == 1 and "C major" in notes[0][0].text
+    ms = root.find("part").findall("measure")
+    assert ms[2].find("attributes/key/fifths").text == "0"
+    assert _spelled(root, 1) == ["Bb", "Eb"]
+    # Tied over the change: still E-flat. After it: naturals; printed flats hold for the bar.
+    assert _spelled(root, 2) == ["Eb", "B", "E"]
+    assert _spelled(root, 3) == ["Bb", "Bb", "B"]
+    # Applying again changes nothing.
+    assert mx.apply_book_keys([root], keys) == [[]]
+
+
+def test_key_override_by_measure_number_and_key_names():
+    assert [mx.parse_key(k) for k in ("C", "Bb", "bb", "F#", "Am", "Ebm", "-3", "+2")] == \
+        [0, -2, -2, 6, 0, -6, -3, 2]
+    root = mx.parse(score([_flat_note("F", 4) + _flat_note("C", 5) + _flat_note("G", 4)] * 3))
+    assert mx.set_key_at([root], "2", 2) == "set"
+    assert _spelled(root, 0) == ["F", "C", "G"]
+    assert _spelled(root, 1) == _spelled(root, 2) == ["F#", "C#", "G"]
+    assert mx.set_key_at([root], "3", 2) == "same"
+    assert mx.set_key_at([root], "9", 2) == "missing"

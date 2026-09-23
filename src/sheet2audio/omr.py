@@ -491,3 +491,75 @@ def _log_notes(log: str) -> list[str]:
 def log_warnings(log: Path, limit: int = 20) -> list[str]:
     """The distinct WARN lines Audiveris printed, without stack traces."""
     return _log_lines(log.read_text(errors="replace"), ("WARN",))[:limit]
+
+
+# ---------------------------------------------------------------- keys from the book
+
+
+@dataclass
+class BookKey:
+    """A key signature Audiveris recognised: in the `page`-th page of music
+    (0-based, counting every page of every sheet in order) at the start of
+    that page's `measure`-th bar (0-based)."""
+
+    page: int
+    measure: int
+    fifths: int
+
+
+def book_keys(book: Path) -> list[BookKey]:
+    """Every key signature in an Audiveris book, as Audiveris recognised it.
+
+    Audiveris' MusicXML export sometimes drops a key change: a key made of
+    natural signs (a cancellation, e.g. B-flat major -> C major) is not
+    exported. The book still holds it. A cancellation counts as C major
+    unless a new key follows it on the same staff."""
+    import xml.etree.ElementTree as ET
+    import zipfile
+
+    out: list[BookKey] = []
+    try:
+        z = zipfile.ZipFile(book)
+    except (OSError, zipfile.BadZipFile):
+        return out
+    page_index = 0
+    with z:
+        sheets = sorted((n for n in z.namelist() if re.fullmatch(r"sheet#(\d+)/sheet#\1\.xml", n)),
+                        key=lambda n: int(re.search(r"#(\d+)", n).group(1)))
+        for name in sheets:
+            try:
+                root = ET.fromstring(z.read(name))
+            except ET.ParseError:
+                continue
+            il = root.find("scale/interline")
+            reach = 12 * float(il.get("main", 20)) if il is not None else 240  # a key's width
+            for page in root.iter("page"):
+                for system in page.iter("system"):
+                    # Bars are numbered from 1 on each page; a cautionary
+                    # stack (courtesy signs at the end of a line) repeats the
+                    # number of the bar before it and is skipped.
+                    stacks = [(float(st.get("left", 0)), float(st.get("right", 0)), st.get("id", ""))
+                              for st in system.iter("stack") if st.get("special") != "CAUTIONARY"]
+                    keys = []
+                    for k in system.iter("key"):
+                        b = k.find("bounds")
+                        if b is None:
+                            continue
+                        x = float(b.get("x", 0))
+                        if k.get("shape") == "KEY_CANCEL":
+                            keys.append((x, k.get("staff"), None))
+                        elif re.fullmatch(r"-?\d", k.get("fifths") or ""):
+                            keys.append((x, k.get("staff"), int(k.get("fifths"))))
+                    by_bar: dict[int, list[int]] = {}
+                    for x, staff, fifths in keys:
+                        if fifths is None:
+                            after = [f for x2, s2, f in keys
+                                     if s2 == staff and f is not None and x < x2 <= x + reach]
+                            fifths = after[0] if after else 0
+                        bar = next((sid for left, right, sid in stacks if left - 5 <= x < right), None)
+                        if bar and bar.isdigit():
+                            by_bar.setdefault(int(bar) - 1, []).append(fifths)
+                    for bar, values in sorted(by_bar.items()):
+                        out.append(BookKey(page_index, bar, max(set(values), key=values.count)))
+                page_index += 1
+    return out

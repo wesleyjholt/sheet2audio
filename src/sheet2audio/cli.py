@@ -66,6 +66,21 @@ def _time_sig(text: str) -> tuple[int, int]:
     return int(m.group(1)), int(m.group(2))
 
 
+def _key_changes(text: str) -> list[tuple[str, int]]:
+    out = []
+    for item in filter(None, (t.strip() for t in text.split(","))):
+        bar, _, key = item.partition(":")
+        if not re.fullmatch(r"\d+", bar.strip()) or not key.strip():
+            raise argparse.ArgumentTypeError(f"use MEASURE:KEY, e.g. 29:C or 29:C,41:G (got '{item}')")
+        try:
+            out.append((str(int(bar)), musicxml.parse_key(key)))
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(str(e)) from None
+    if not out:
+        raise argparse.ArgumentTypeError("use MEASURE:KEY, e.g. 29:C")
+    return out
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="sheet2audio",
@@ -86,6 +101,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
                        default=1.0, help="multiply every tempo by this (e.g. 0.8 = slower)")
     p.add_argument("--time", type=_time_sig, metavar="N/D",
                    help="time signature to use if OMR read none, e.g. 3/4")
+    p.add_argument("--key", type=_key_changes, metavar="MEASURE:KEY",
+                   help="key changes OMR missed, e.g. 29:C or 29:C,41:Eb (Am etc. for minor); "
+                        "the notes from there on are re-spelled")
     p.add_argument("--soundfont", help="SoundFont (.sf2/.sf3) to play the music with")
     p.add_argument("--parts", metavar="NAMES",
                    help="name the parts, one per staff group in score order, e.g. "
@@ -321,11 +339,23 @@ def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codec
         report["audiveris_warnings"] = omr.log_warnings(res.log)
 
     # 2. Clean up, split merged pieces
-    roots, file_notes = [], []
-    for mf in movement_files:
-        root = musicxml.read_musicxml(mf)
+    read = [musicxml.read_musicxml(mf) for mf in movement_files]
+    for root in read:
         musicxml.tag_measures(root)
-        sn = musicxml.sanitize(root, src.name)
+    key_notes = [[] for _ in read]
+    if audiveris is not None and book:
+        key_notes = musicxml.apply_book_keys(read, omr.book_keys(book))
+    for bar, fifths in a.key or []:
+        done = musicxml.set_key_at(read, bar, fifths)
+        what = musicxml.key_label(fifths)
+        notes.append({"set": f"Measure {bar}: key set to {what} as asked.",
+                      "same": f"Measure {bar} is already in {what}; --key changed nothing.",
+                      "mixed": f"Measure {bar}: the parts are in different keys there "
+                               "(transposing instruments), so --key was not applied.",
+                      "missing": f"--key: there is no measure {bar}."}[done])
+    roots, file_notes = [], []
+    for root, kn in zip(read, key_notes):
+        sn = kn + musicxml.sanitize(root, src.name)
         if a.time and musicxml.set_time(root, *a.time):
             notes.append(f"No time signature was read; using {a.time[0]}/{a.time[1]} as asked.")
         pieces = musicxml.split_movements(root)

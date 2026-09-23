@@ -971,6 +971,174 @@ def _renumber_from(measures: list[ET.Element], start: int) -> None:
             n += 1
 
 
+# ---------------------------------------------------------------- keys
+
+_SHARPS = "FCGDAEB"
+_ACCIDENTAL_ALTER = {"sharp": 1, "flat": -1, "natural": 0, "double-sharp": 2,
+                     "sharp-sharp": 2, "flat-flat": -2, "natural-sharp": 1,
+                     "natural-flat": -1}
+_KEY_NAMES_IN = {"C": 0, "G": 1, "D": 2, "A": 3, "E": 4, "B": 5, "F#": 6, "C#": 7,
+                 "F": -1, "BB": -2, "EB": -3, "AB": -4, "DB": -5, "GB": -6, "CB": -7}
+
+
+def parse_key(text: str) -> int:
+    """'C', 'Bb', 'F#', 'Am' (minor), 'Ebm' or a number of fifths ('-3')."""
+    t = text.strip().replace("♭", "b").replace("♯", "#")
+    if re.fullmatch(r"[+-]?\d", t) and -7 <= int(t) <= 7:
+        return int(t)
+    m = re.fullmatch(r"([A-Ga-g])([b#]?)(m|min|minor)?", t)
+    fifths = m and _KEY_NAMES_IN.get(m.group(1).upper() + m.group(2).upper())
+    if fifths is None:
+        raise ValueError(f"unknown key '{text}' (use e.g. C, Bb, F#, Am or -2)")
+    return fifths - 3 if m.group(3) else fifths
+
+
+def _key_alter(step: str, fifths: int) -> int:
+    if fifths > 0 and step in _SHARPS[:fifths]:
+        return 1
+    if fifths < 0 and step in _SHARPS[::-1][:-fifths]:
+        return -1
+    return 0
+
+
+def _key_in_effect(measures: list[ET.Element], index: int) -> int | None:
+    fifths = None
+    for m in measures[: index + 1]:
+        for k in m.iter("key"):
+            f = k.findtext("fifths")
+            if f is not None and f.strip().lstrip("-").isdigit():
+                fifths = int(f)
+    return fifths
+
+
+def _respell(measures: list[ET.Element], fifths: int) -> None:
+    """Spell every note from the key signature and the accidentals printed
+    before it in its bar (as notation defines them). A tied-over note takes
+    the pitch of the note it is tied from; one tied from before `measures`
+    keeps its pitch."""
+    tied: dict[tuple[str, str, str], int] = {}  # pitch of the latest tie start
+    for m in measures:
+        carried: dict[tuple[str, str, str], int] = {}
+        for n in m.findall("note"):
+            p = n.find("pitch")
+            if p is None:
+                continue
+            step, octave = (p.findtext("step") or "").strip(), (p.findtext("octave") or "").strip()
+            where = ((n.findtext("staff") or "1").strip(), step, octave)
+            acc = n.find("accidental")
+            ties = {t.get("type") for t in n.findall("tie")}
+            if acc is not None and (acc.text or "").strip() in _ACCIDENTAL_ALTER:
+                alter = _ACCIDENTAL_ALTER[acc.text.strip()]
+                carried[where] = alter
+            elif "stop" in ties:
+                if where not in tied:
+                    continue
+                alter = tied[where]
+            else:
+                alter = carried.get(where, _key_alter(step, fifths))
+            if "start" in ties:
+                tied[where] = alter
+            elif "stop" in ties:
+                tied.pop(where, None)
+            el = p.find("alter")
+            if alter == 0:
+                if el is not None:
+                    p.remove(el)
+            else:
+                if el is None:
+                    el = ET.Element("alter")
+                    p.insert(list(p).index(p.find("step")) + 1 if p.find("step") is not None else 0, el)
+                el.text = str(alter)
+
+
+def set_key(root: ET.Element, index: int, fifths: int) -> bool:
+    """Make `fifths` the key from measure `index` (0-based) on, in every part,
+    and re-spell the notes until the next key change. False if the parts
+    are in different keys there (transposing instruments) or it is already
+    that key."""
+    parts = _parts(root)
+    current = {_key_in_effect(p.findall("measure"), index) for p in parts}
+    if len(current) > 1 or current == {fifths}:
+        return False
+    for part in parts:
+        ms = part.findall("measure")
+        if index >= len(ms):
+            continue
+        m = ms[index]
+        attrs = m.find("attributes")
+        if attrs is None:
+            attrs = ET.Element("attributes")
+            _insert_after_header(m, attrs)
+        for k in attrs.findall("key"):
+            attrs.remove(k)
+        key = ET.Element("key")
+        ET.SubElement(key, "fifths").text = str(fifths)
+        attrs.insert(sum(1 for c in attrs if c.tag in ("footnote", "level", "divisions")), key)
+        end = next((j for j in range(index + 1, len(ms))
+                    if any(True for _ in ms[j].iter("key"))), len(ms))
+        _respell(ms[index:end], fifths)
+    return True
+
+
+def apply_book_keys(roots: list[ET.Element], keys) -> list[list[Note]]:
+    """Put back key changes that Audiveris recognised but left out of its
+    MusicXML (`keys` from omr.book_keys). Audiveris starts a new page of
+    its own at each movement, so pages here are the first bar of each
+    movement and every bar marked new-page."""
+    pages: list[tuple[int, int, int]] = []  # (movement, first bar, bar after the last)
+    for r, root in enumerate(roots):
+        parts = _parts(root)
+        if not parts:
+            continue
+        ms = parts[0].findall("measure")
+        starts = [i for i, m in enumerate(ms) if i == 0 or any(
+            pr.get("new-page") == "yes" for pr in m.findall("print"))]
+        pages += [(r, a, b) for a, b in zip(starts, starts[1:] + [len(ms)])]
+    notes: list[list[Note]] = [[] for _ in roots]
+    for k in sorted(keys, key=lambda k: (k.page, k.measure)):
+        if k.page >= len(pages):
+            continue
+        r, first, end = pages[k.page]
+        root, index = roots[r], first + k.measure
+        parts = _parts(root)
+        ms = parts[0].findall("measure")
+        if index >= end or _key_in_effect(ms, index) is None:
+            continue
+        # Only where the export has no key at all: a key it did write wins.
+        if any(any(True for _ in p.findall("measure")[index].iter("key"))
+               for p in parts if index < len(p.findall("measure"))):
+            continue
+        if set_key(root, index, k.fifths):
+            notes[r].append(Note(f"Measure {{m}}: the key changes to {key_label(k.fifths)} here; "
+                              "Audiveris recognised it but left it out of its export, so it was "
+                              "put back and the notes after it re-spelled.", _ref(ms[index])))
+    return notes
+
+
+def set_key_at(roots: list[ET.Element], number: str, fifths: int) -> str:
+    """Set the key from the first bar numbered `number` (as printed); returns
+    'set', 'same' (already that key), 'mixed' (parts in different keys) or
+    'missing'."""
+    for root in roots:
+        parts = _parts(root)
+        if not parts:
+            continue
+        for i, m in enumerate(parts[0].findall("measure")):
+            if m.get("number", "").strip() == number:
+                if set_key(root, i, fifths):
+                    return "set"
+                keys = {_key_in_effect(p.findall("measure"), i) for p in parts}
+                return "same" if keys == {fifths} else "mixed"
+    return "missing"
+
+
+def key_label(fifths: int) -> str:
+    """-2 -> 'B♭ major / G minor'."""
+    majors = "C♭ G♭ D♭ A♭ E♭ B♭ F C G D A E B F♯ C♯".split()
+    minors = "A♭ E♭ B♭ F C G D A E B F♯ C♯ G♯ D♯ A♯".split()
+    return f"{majors[fifths + 7]} major / {minors[fifths + 7]} minor"
+
+
 def set_time(root: ET.Element, beats: int, beat_type: int) -> bool:
     """Give the score a time signature if OMR found none. True if one was added."""
     if root.find(".//time") is not None:
