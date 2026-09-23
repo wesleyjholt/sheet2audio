@@ -24,8 +24,10 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from . import musicxml, omr, synth, tools
@@ -603,12 +605,46 @@ def _serve(outdir: Path, port: int, page: str, video: str) -> None:
         print(f"  http://{h}:{port}/{page_q}"
               + (f"   (video: http://{h}:{port}/{video_q})" if video else ""))
     sys.stdout.flush()
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    if ip and _answers("127.0.0.1", port) and not _answers(ip, port):
+        _firewall_help(outdir, port)
     try:
-        httpd.serve_forever()
+        while thread.is_alive():
+            thread.join(0.5)
     except KeyboardInterrupt:
         pass
     finally:
+        httpd.shutdown()
         httpd.server_close()
+
+
+def _answers(host: str, port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/", timeout=3) as r:
+            return r.status < 500
+    except (OSError, ValueError):
+        return False
+
+
+def _firewall_help(outdir: Path, port: int) -> None:
+    """The server answers on this Mac but not on its network address: a
+    firewall is turning other devices away."""
+    app = Path(sys.base_prefix) / "Resources" / "Python.app"
+    # the firewall lists the real location, not Homebrew's opt/ shortcut
+    app = app.resolve() if app.exists() else Path(sys.executable).resolve()
+    print(f"\nWarning: other devices cannot reach this page: the firewall is blocking incoming "
+          f"connections for this Python\n  ({app}).", file=sys.stderr)
+    if sys.platform == "darwin":
+        print("Fix it once, in either of these ways:\n"
+              "  - System Settings > Network > Firewall > Options..., find 'Python' and choose\n"
+              "    'Allow incoming connections'; or run\n"
+              f"    sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp {shlex.quote(str(app))}\n"
+              "  - or stop this (Ctrl-C) and share the folder with Apple's built-in Python, which\n"
+              "    the firewall allows:\n"
+              f"    /usr/bin/python3 -m http.server {port} --directory {shlex.quote(str(outdir))}",
+              file=sys.stderr)
+    sys.stderr.flush()
 
 
 def _on_signal(signum, frame):

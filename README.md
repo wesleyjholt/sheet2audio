@@ -73,6 +73,19 @@ The output goes to `my-piece_sheet2audio/`, next to the PDF:
 
   This prints a link such as `http://192.168.1.20:8000/my-piece.html`. Open it in Safari on a phone on the same Wi-Fi. Press Ctrl-C to stop sharing. While it runs, anyone on the network can open the files in that output folder.
 
+#### If the phone can't open the link
+
+- **Firewall.** `--serve` checks itself and warns when the Mac's firewall turns other devices away. The usual cause is that macOS asked "Do you want Python to accept incoming network connections?" and the answer was Deny. You can fix it in either of these ways:
+  - In System Settings > Network > Firewall > Options…, set "Python" to "Allow incoming connections".
+  - Share the output folder with Apple's own Python instead, which the firewall allows:
+
+    ```bash
+    /usr/bin/python3 -m http.server 8000 --directory my-piece_sheet2audio
+    ```
+
+- **Guest, school or work Wi-Fi.** These networks often block devices from reaching each other. Turn on the iPhone's Personal Hotspot, join it from the Mac, and run `--serve` again; the link it prints then works on the phone.
+- **Same network?** The phone must be on the same Wi-Fi as the Mac, and the Mac must stay awake while you use the page.
+
 ### Options
 
 ```bash
