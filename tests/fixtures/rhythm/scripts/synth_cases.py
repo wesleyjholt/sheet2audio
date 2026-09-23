@@ -1,5 +1,6 @@
+from pathlib import Path
 import sys
-sys.path.insert(0, "/Users/holtw/.local/share/project-worktrees/sheet-music-to-audio/src")
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "src"))
 from sheet2audio.musicxml import repair_underfull_measures
 from sheet2audio.render import render_musicxml
 

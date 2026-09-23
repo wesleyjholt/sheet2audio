@@ -6,7 +6,7 @@ never saw the rest (later voices keep their time); a leading rest just vanishes 
 """
 import sys, xml.etree.ElementTree as ET
 from pathlib import Path
-sys.path.insert(0, "/Users/holtw/.local/share/project-worktrees/sheet-music-to-audio/src")
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "src"))
 from sheet2audio.musicxml import read_musicxml_bytes
 src, dst, specs = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3:]
 root = ET.fromstring(read_musicxml_bytes(src))

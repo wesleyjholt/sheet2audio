@@ -1,6 +1,6 @@
 import sys, json
 from pathlib import Path
-ROOT = Path("/Users/holtw/.local/share/project-worktrees/sheet-music-to-audio")
+ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "tests"))
 from evaluate import evaluate
 cases = {  # name: (bar_ql, pickup)

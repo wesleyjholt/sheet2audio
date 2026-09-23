@@ -2,7 +2,7 @@
 import sys, xml.etree.ElementTree as ET
 from fractions import Fraction
 from pathlib import Path
-sys.path.insert(0, "/Users/holtw/.local/share/project-worktrees/sheet-music-to-audio/src")
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "src"))
 from sheet2audio.musicxml import read_musicxml_bytes, _MeasureTiming, _pad_measure
 root = ET.fromstring(read_musicxml_bytes(Path(sys.argv[1])))
 div, bar = 1, None
