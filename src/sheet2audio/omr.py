@@ -73,7 +73,7 @@ class _Staged:
 
 def _stage_pdf(source: Path, dest_dir: Path, pages: list[int] | None) -> _Staged:
     from pypdf import PdfReader, PdfWriter
-    from pypdf.errors import PdfReadError
+    from pypdf.errors import DependencyError, PdfReadError
 
     try:
         reader = PdfReader(str(source))
@@ -82,6 +82,16 @@ def _stage_pdf(source: Path, dest_dir: Path, pages: list[int] | None) -> _Staged
         n = len(reader.pages)
     except (PdfReadError, OSError, ValueError, KeyError) as e:
         raise OMRError(f"{source.name} is not a readable PDF ({e}).") from None
+    except DependencyError:
+        # An encryption method pypdf cannot handle here; Audiveris (PDFBox)
+        # can still read the file as it is.
+        if pages:
+            raise OMRError(f"{source.name} is encrypted in a way that prevents choosing pages; "
+                           "run it without --sheets, or save an unprotected copy.") from None
+        dest = dest_dir / "score.pdf"
+        shutil.copyfile(source, dest)
+        return _Staged(dest, None, notes=["The PDF is encrypted, so the scan-resolution check "
+                                          "was skipped."])
     if n == 0:
         raise OMRError(f"{source.name} has no pages.")
     if pages and max(pages) > n:
@@ -98,14 +108,63 @@ def _stage_pdf(source: Path, dest_dir: Path, pages: list[int] | None) -> _Staged
     else:
         shutil.copyfile(source, dest)
     staged = _Staged(dest, selected)
-    dpi = _scanned_pdf_dpi(reader, selected)
-    # Audiveris draws PDF pages at 300 dpi. For a scan stored at 130-290 dpi
-    # that resampling loses staves; reading at the scan's own resolution works
-    # (below ~130 dpi the upsampling helps, so it is left alone).
-    if dpi and 130 <= dpi < 290:
-        staged.constants[C_PDF_RES] = str(int(round(dpi)))
-        staged.constants[C_MIN_INTERLINE] = "8"
+    staged.constants.update(_pdf_constants(reader, selected, staged.notes))
     return staged
+
+
+def _pdf_constants(reader, pages: list[int], notes: list[str]) -> dict[str, str]:
+    """Audiveris draws every PDF page at 300 dpi (one setting for the whole
+    file). Adjust that for scans stored at another resolution, and so that no
+    page exceeds Audiveris' 20-megapixel limit."""
+    inches = []
+    for p in pages:
+        box = reader.pages[p - 1].mediabox
+        inches.append((float(box.width) / 72.0, float(box.height) / 72.0))
+    largest = max(w * h for w, h in inches)
+    cap = math.sqrt(MAX_PIXELS * 0.95 / largest)  # highest dpi that fits 20 MP
+    dpi = _scanned_pdf_dpi(reader, pages)
+    if dpi and 130 <= dpi < 290:
+        # A scan at 130-290 dpi loses staves when resampled to 300; read it
+        # at its own resolution (below ~130 dpi the enlargement helps).
+        return {C_PDF_RES: str(int(min(dpi, cap))), C_MIN_INTERLINE: "8"}
+    if dpi and dpi < 130 and cap < 300:
+        # A scan stored at a low nominal resolution on a huge page (e.g. a
+        # 300-dpi scan saved as a 72-dpi PDF): draw it pixel for pixel.
+        return {C_PDF_RES: str(int(min(dpi, cap)))}
+    if cap < 300:
+        notes.append(f"The pages are unusually large ({inches[0][0]:.0f}x{inches[0][1]:.0f} in); "
+                     f"they were read at {cap:.0f} dpi to stay within Audiveris' limit.")
+        return {C_PDF_RES: str(int(cap))}
+    return {}
+
+
+def _visible_text(page) -> bool:
+    """True if the page shows text. Text in render mode 3 (invisible, as
+    scanner apps write for searchable PDFs) does not count."""
+    from pypdf.generic import ContentStream
+
+    try:
+        contents = page.get_contents()
+        if contents is None:
+            return False
+        ops = ContentStream(contents, page.pdf).operations
+    except Exception:  # noqa: BLE001
+        return bool((page.extract_text() or "").strip())
+    mode, stack = 0, []
+    for operands, op in ops:
+        if op == b"q":
+            stack.append(mode)
+        elif op == b"Q":
+            mode = stack.pop() if stack else 0
+        elif op == b"Tr" and operands:
+            mode = int(operands[0])
+        elif op in (b"Tj", b"TJ", b"'", b'"') and mode != 3:
+            text = operands[-1] if operands else ""
+            if isinstance(text, list):
+                text = "".join(x for x in text if isinstance(x, str))
+            if str(text).strip():
+                return True
+    return False
 
 
 def _scanned_pdf_dpi(reader, pages: list[int]) -> float | None:
@@ -118,7 +177,7 @@ def _scanned_pdf_dpi(reader, pages: list[int]) -> float | None:
             xobjs = xobjs.get_object() if xobjs is not None else {}
             images = [x.get_object() for x in xobjs.values()
                       if x.get_object().get("/Subtype") == "/Image"]
-            if len(images) != 1 or (page.extract_text() or "").strip():
+            if len(images) != 1 or _visible_text(page):
                 return None
             width_in = float(page.mediabox.width) / 72.0
             dpis.append(int(images[0]["/Width"]) / width_in)
@@ -132,7 +191,9 @@ def _stage_image(source: Path, dest_dir: Path, pages: list[int] | None) -> _Stag
 
     try:
         img = Image.open(source)
-        n = getattr(img, "n_frames", 1)
+        # A camera JPEG can carry a second picture (gain map, preview); it is
+        # still one page.
+        n = 1 if img.format in ("MPO", "JPEG") else getattr(img, "n_frames", 1)
     except (UnidentifiedImageError, OSError) as e:
         raise OMRError(f"{source.name} is not a readable image ({e}).") from None
     if pages and max(pages) > n:
@@ -140,10 +201,11 @@ def _stage_image(source: Path, dest_dir: Path, pages: list[int] | None) -> _Stag
                        f"page {max(pages)}.")
     selected = pages or list(range(1, n + 1))
     notes = []
-    frames = []
+    frames, dpis = [], []
     for p in selected:
         img.seek(p - 1)
         frame = ImageOps.exif_transpose(img.copy())
+        dpi = _image_dpi(img.info.get("dpi"), frame.size)
         if frame.mode in ("RGBA", "LA", "PA") or (frame.mode == "P" and "transparency" in frame.info):
             frame = frame.convert("RGBA")
             white = Image.new("RGBA", frame.size, (255, 255, 255, 255))
@@ -158,18 +220,21 @@ def _stage_image(source: Path, dest_dir: Path, pages: list[int] | None) -> _Stag
         if w * h > MAX_PIXELS * 0.97:
             k = math.sqrt(MAX_PIXELS * 0.95 / (w * h))
             frame = frame.convert("L").resize((int(w * k), int(h * k)), Image.Resampling.LANCZOS)
-            notes.append(f"The image was {w * h / 1e6:.0f} megapixels; it was shrunk to "
+            dpi *= k
+            notes.append(f"Page {p} was {w * h / 1e6:.0f} megapixels; it was shrunk to "
                          f"{frame.size[0]}x{frame.size[1]} (Audiveris' limit is 20).")
         frames.append(frame)
-    dpi = _image_dpi(img, frames[0])
-    if dpi < 130:
-        # Too coarse for Audiveris to find the staff lines. Wrapped in a PDF of
-        # the right page size, the image is drawn at 300 dpi, i.e. enlarged
-        # with smoothing, which Audiveris can read.
+        dpis.append(dpi)
+    low = [p for p, d in zip(selected, dpis) if d < 130]
+    if low:
+        # Too coarse for Audiveris to find the staff lines. As PDF pages of
+        # the right size, the images are drawn at 300 dpi, i.e. enlarged with
+        # smoothing, which Audiveris can read; sharp pages are drawn 1:1.
         dest = dest_dir / "score.pdf"
-        frames[0].save(dest, save_all=True, append_images=frames[1:], resolution=float(dpi))
-        notes.append(f"The image is only about {dpi:.0f} dpi; it was enlarged for recognition, "
-                     "so expect mistakes (300 dpi scans work best).")
+        _images_to_pdf(frames, dpis, dest)
+        notes.append(f"Page{'s' if len(low) > 1 else ''} {', '.join(map(str, low))}: only about "
+                     f"{min(dpis):.0f} dpi; enlarged for recognition, so expect mistakes "
+                     "(300 dpi scans work best).")
     elif len(frames) == 1:
         dest = dest_dir / "score.png"
         frames[0].save(dest)
@@ -179,16 +244,36 @@ def _stage_image(source: Path, dest_dir: Path, pages: list[int] | None) -> _Stag
     return _Staged(dest, selected, notes=notes, is_image=True)
 
 
-def _image_dpi(img, frame) -> float:
-    """The image's resolution: its own tag if plausible, else assume the width
-    of a letter/A4 page (about 8.3-8.5 inches)."""
-    tag = img.info.get("dpi")
+def _images_to_pdf(frames, dpis: list[float], dest: Path) -> None:
+    """One PDF page per image, each sized for its own resolution, so that at
+    300 dpi a sharp page is drawn 1:1 and a coarse one is enlarged."""
+    from pypdf import PdfReader, PdfWriter
+
+    writer = PdfWriter()
+    for frame, dpi in zip(frames, dpis):
+        # Never let the 300-dpi drawing exceed 20 megapixels.
+        w, h = frame.size
+        dpi = max(dpi, math.sqrt(w * h * 300 * 300 / (MAX_PIXELS * 0.95)))
+        one = dest.with_suffix(".one.pdf")
+        frame.save(one, resolution=float(dpi))
+        writer.add_page(PdfReader(str(one)).pages[0])
+    with open(dest, "wb") as f:
+        writer.write(f)
+    dest.with_suffix(".one.pdf").unlink(missing_ok=True)
+
+
+def _image_dpi(tag, size: tuple[int, int]) -> float:
+    """An image's resolution. The tag is trusted only when it describes a
+    plausible page (at most ~14 inches wide); a tag that makes a normal
+    page's worth of pixels look coarse (96 dpi from a screenshot tool) is
+    ignored in favour of assuming a letter/A4-width page."""
+    guess = size[0] / 8.5
     try:
         d = float(tag[0]) if tag else 0.0
     except (TypeError, ValueError, IndexError):
         d = 0.0
-    if not 50 <= d <= 1200 or d == 72:  # 72 is usually a meaningless default
-        d = frame.size[0] / 8.5
+    if not 50 <= d <= 1200 or size[0] / d > 14 or (d < 130 <= guess):
+        return guess
     return d
 
 
@@ -283,25 +368,54 @@ def _keep_book(work: Path, omr_dir: Path, source: Path) -> Path | None:
     return dest
 
 
+_SHEET_TAG = re.compile(r"\[\S*#(\d+)\]")
+_LOW_RES = re.compile(r"too low interline|interline value of \d+ pixels", re.IGNORECASE)
+
+
+def _sheet_reasons(log: str) -> dict[int, str]:
+    """Why each invalid page (numbered in the staged file) failed:
+    'empty' (no staff lines), 'lowres', or 'other'."""
+    text: dict[int, list[str]] = {}
+    current = None
+    for line in log.splitlines():
+        m = _SHEET_TAG.search(line[:60])
+        if m:
+            current = int(m.group(1))
+        if current is not None:
+            text.setdefault(current, []).append(line)
+    reasons = {}
+    for k in {int(x) for x in _INVALID.findall(log)}:
+        body = "\n".join(text.get(k, []))
+        if _LOW_RES.search(body):
+            reasons[k] = "lowres"
+        elif re.search(r"No regularly spaced lines|No staff", body, re.IGNORECASE):
+            reasons[k] = "empty"
+        else:
+            reasons[k] = "other"
+    return reasons
+
+
 def _plan_retry(source: Path, staged: _Staged, log: str, notes: list[str], tmp: Path,
                 work: Path) -> _Staged | None:
     if staged.pages is None:
         return None
-    invalid = sorted({int(k) for k in _INVALID.findall(log)})
-    if invalid and len(invalid) < len(staged.pages):
-        bad = [staged.pages[k - 1] for k in invalid if k <= len(staged.pages)]
-        keep = [p for k, p in enumerate(staged.pages, 1) if k not in invalid]
-        notes.append(f"Page{'s' if len(bad) > 1 else ''} {', '.join(map(str, bad))} skipped: "
-                     "no staves found there (a title, text or blank page?).")
-        retry = _stage(source, tmp, work, keep)
-        retry.constants = dict(staged.constants)
-        return retry
-    low = re.search(r"too low interline|interline value of \d+ pixels", log, re.IGNORECASE)
+    reasons = _sheet_reasons(log)
+    low = _LOW_RES.search(log) is not None
     if low and staged.constants.get(C_MIN_INTERLINE) != "8":
         notes.append("The scan's resolution is low for Audiveris; it was read with relaxed "
                      "settings, so expect more mistakes (300 dpi scans work best).")
         retry = _Staged(staged.path, staged.pages, dict(staged.constants), is_image=staged.is_image)
         retry.constants[C_MIN_INTERLINE] = "8"
+        return retry
+    empty = sorted(k for k, r in reasons.items() if r in ("empty", "other"))
+    if empty and len(empty) < len(staged.pages):
+        bad = [staged.pages[k - 1] for k in empty if k <= len(staged.pages)]
+        keep = [p for k, p in enumerate(staged.pages, 1) if k not in empty]
+        notes.append(f"Page{'s' if len(bad) > 1 else ''} {', '.join(map(str, bad))} skipped: "
+                     "no music found there (a title, text or blank page?).")
+        retry = _stage(source, tmp, work, keep)  # its own resolution settings for these pages
+        if staged.constants.get(C_MIN_INTERLINE):
+            retry.constants.setdefault(C_MIN_INTERLINE, staged.constants[C_MIN_INTERLINE])
         return retry
     if C_PDF_RES in staged.constants:
         # Reading the scan at its own resolution failed: try Audiveris' default.
@@ -311,8 +425,8 @@ def _plan_retry(source: Path, staged: _Staged, log: str, notes: list[str], tmp: 
 
 _HINTS = [
     (r"Too large image: ([\d,]+) pixels",
-     lambda m: f"A page is {int(m.group(1).replace(',', '')) / 1e6:.0f} megapixels; Audiveris "
-               "accepts at most 20. Re-export or scan the PDF at 300 dpi."),
+     lambda m: f"A page came out at {int(m.group(1).replace(',', '')) / 1e6:.0f} megapixels; "
+               "Audiveris accepts at most 20."),
     (r"No regularly spaced lines found",
      lambda m: "No staff lines were found: is it a blank or text-only page, or a very noisy scan?"),
     (r"too low interline|interline value of \d+ pixels",

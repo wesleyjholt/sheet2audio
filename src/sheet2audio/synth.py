@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -94,9 +95,19 @@ def encode(ffmpeg: Path, raw_wav: Path, outputs: dict[str, Path],
     peak = peak_db(ffmpeg, raw_wav, end_s)
     gain = 0.0 if peak is None else PEAK_TARGET_DB - peak
     for fmt, dest in outputs.items():
+        part = partial_name(dest)  # never leave a half-written file under the final name
         cmd = [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw_wav),
-               "-t", f"{end_s:.3f}", "-af", audio_filter(gain, end_s), *codecs[fmt], str(dest)]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise SynthError(f"FFmpeg could not write {dest.name}:\n{proc.stderr}")
+               "-t", f"{end_s:.3f}", "-af", audio_filter(gain, end_s), *codecs[fmt], str(part)]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise SynthError(f"FFmpeg could not write {dest.name}:\n{proc.stderr}")
+            os.replace(part, dest)
+        finally:
+            part.unlink(missing_ok=True)
     return gain
+
+
+def partial_name(dest: Path) -> Path:
+    """A hidden sibling with the same extension (FFmpeg picks the format from it)."""
+    return dest.with_name(f".{dest.stem}.partial{dest.suffix}")

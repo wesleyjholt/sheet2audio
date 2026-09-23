@@ -132,19 +132,71 @@ def _bar_style(m: ET.Element, location: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------- notes about measures
+
+TAG = "s2a-ref"  # temporary attribute: a measure's index before clean-up and splitting
+
+
+@dataclass
+class Note:
+    """Something to tell the user. `{m}` in `text` stands for the number of
+    the measure tagged `ref`, looked up after the score has been split."""
+
+    text: str
+    ref: str | None = None
+
+
+def tag_measures(root: ET.Element) -> None:
+    for part in _parts(root):
+        for i, m in enumerate(part.findall("measure")):
+            m.set(TAG, str(i))
+
+
+def untag(root: ET.Element) -> None:
+    for m in root.iter("measure"):
+        m.attrib.pop(TAG, None)
+
+
+def resolve_notes(notes: list[Note], pieces: list[ET.Element],
+                  titles: list[str]) -> list[str]:
+    """Turn notes into text, with measure numbers as they are in each piece
+    and, when there are several pieces, the piece's title in front."""
+    where: dict[str, tuple[int, str]] = {}
+    for k, piece in enumerate(pieces):
+        parts = _parts(piece)
+        if parts:
+            for i, m in enumerate(parts[0].findall("measure")):
+                if m.get(TAG) is not None:
+                    where.setdefault(m.get(TAG), (k, _num(m, i)))
+    out = []
+    for n in notes:
+        if n.ref is None or n.ref not in where:
+            text = n.text.replace("{m}", str(int(n.ref) + 1) if n.ref and n.ref.isdigit() else "?")
+            out.append(text)
+            continue
+        k, label = where[n.ref]
+        text = n.text.replace("{m}", label)
+        out.append(f"{titles[k]}: {text}" if len(pieces) > 1 else text)
+    return list(dict.fromkeys(out))
+
+
 # ---------------------------------------------------------------- sanitize
 
 
-def sanitize(root: ET.Element, source_name: str | None = None) -> list[str]:
-    """Fix what Verovio would misplay or crash on. Returns notes for the user."""
-    notes: list[str] = []
+def sanitize(root: ET.Element, source_name: str | None = None) -> list[Note]:
+    """Fix what Verovio would misplay or crash on. Call tag_measures() first
+    so the notes can name measures."""
+    notes: list[Note] = []
     audiveris = is_audiveris(root)
     if source_name:
         _fix_source(root, source_name)
-    notes += _octave_shifts(root, audiveris)
+    if audiveris:
+        notes += _drop_octave_shifts(root)
+    notes += _implausible_tempos(root)
+    _order_ties(root)
     _normalize_repeat_barlines(root)
+    notes += _drop_empty_measures(root)  # before the repeat fix: it moves barlines
     notes += _implied_forward_repeats(root)
-    notes += _drop_empty_measures(root)
     notes += _tempo_from_words(root)
     notes += _jumps(root)
     notes += _check_keys(root)
@@ -160,52 +212,128 @@ def _fix_source(root: ET.Element, source_name: str) -> None:
             el.text = source_name
 
 
-def _octave_shifts(root: ET.Element, audiveris: bool) -> list[str]:
+def _ref(m: ET.Element) -> str | None:
+    return m.get(TAG)
+
+
+def _drop_octave_shifts(root: ET.Element) -> list[Note]:
     """Verovio 6.3 crashes on an 8va/8vb line that is never closed.
 
     Audiveris writes octave-shift starts without stops, and it writes the
     printed pitch rather than the sounding pitch, so its 8va lines would not
     change the sound correctly anyway. Many are also misreads (scanner specks,
-    a dotted metronome mark). For Audiveris output we drop them and say where
-    they were; for other files we close any line left open.
+    a dotted metronome mark). We drop them and say where they were.
     """
     notes = []
     for part in _parts(root):
-        measures = part.findall("measure")
-        dropped = []
-        open_: dict[tuple[str, str], tuple[str, str]] = {}  # (number, staff) -> (size, measure)
-        for i, m in enumerate(measures):
+        for m in part.findall("measure"):
             for d in list(m.findall("direction")):
-                staff = (d.findtext("staff") or "1").strip()
+                found = False
                 for dt in list(d.findall("direction-type")):
                     os_ = dt.find("octave-shift")
                     if os_ is None:
                         continue
-                    kind = os_.get("type", "")
-                    key = (os_.get("number", "1"), staff)
-                    if audiveris:
-                        if kind in ("up", "down"):
-                            dropped.append(_num(m, i))
-                        d.remove(dt)
-                    elif kind in ("up", "down"):
-                        open_[key] = (os_.get("size", "8"), _num(m, i))
-                    elif kind == "stop":
-                        open_.pop(key, None)
-                if audiveris and d.find("direction-type") is None:
+                    found |= os_.get("type") in ("up", "down")
+                    d.remove(dt)
+                if d.find("direction-type") is None:
                     m.remove(d)
-        for (number, staff), (size, where) in open_.items():
-            d = ET.SubElement(measures[-1], "direction")
-            dt = ET.SubElement(d, "direction-type")
-            ET.SubElement(dt, "octave-shift", {"type": "stop", "number": number, "size": size})
-            ET.SubElement(d, "staff").text = staff
-            notes.append(f"An 8va/8vb line starting in measure {where} had no end; it now runs to the end.")
-        if dropped:
-            where = ", ".join(sorted(set(dropped), key=lambda s: (len(s), s)))
-            notes.append(
-                f"An 8va/8vb sign was read at measure {where}. It was ignored, so those notes play "
-                "as printed: if the sign is real they sound an octave off."
-            )
+                if found:
+                    notes.append(Note("An 8va/8vb sign was read at measure {m}. It was ignored, "
+                                      "so those notes play as printed: if the sign is real they "
+                                      "sound an octave off.", _ref(m)))
     return notes
+
+
+def close_octave_lines(root: ET.Element) -> list[Note]:
+    """Close every 8va/8vb line left open at the end of this score (Verovio
+    crashes on an open one). Run it on each piece after splitting."""
+    notes = []
+    for part in _parts(root):
+        measures = part.findall("measure")
+        open_: dict[tuple[str, str], tuple[str, ET.Element]] = {}
+        for m in measures:
+            for d in m.findall("direction"):
+                staff = (d.findtext("staff") or "1").strip()
+                for os_ in d.iter("octave-shift"):
+                    key = (os_.get("number", "1"), staff)
+                    if os_.get("type") in ("up", "down"):
+                        open_[key] = (os_.get("size", "8"), m)
+                    elif os_.get("type") == "stop":
+                        open_.pop(key, None)
+        for (number, staff), (size, start) in open_.items():
+            d = ET.SubElement(measures[-1], "direction")
+            ET.SubElement(ET.SubElement(d, "direction-type"), "octave-shift",
+                          {"type": "stop", "number": number, "size": size})
+            ET.SubElement(d, "staff").text = staff
+            notes.append(Note("An 8va/8vb line starting in measure {m} had no end; it now runs "
+                              "to the end of the piece.", _ref(start)))
+    return notes
+
+
+def _implausible_tempos(root: ET.Element) -> list[Note]:
+    """A misread metronome mark ('1oo' for 100) gives tempos like 1 BPM, which
+    overflow MIDI's tempo field; audio and highlighting then run at different
+    speeds. Remove such marks and tempos."""
+    notes = []
+    for part in _parts(root):
+        for m in part.findall("measure"):
+            for d in list(m.findall("direction")):
+                bad = []
+                for mt in d.iter("metronome"):
+                    pm = (mt.findtext("per-minute") or "").strip()
+                    try:
+                        ok = 20 <= float(pm) <= 400
+                    except ValueError:
+                        ok = False
+                    if not ok:
+                        bad.append(pm)
+                        for dt in list(d.findall("direction-type")):
+                            if dt.find("metronome") is mt:
+                                d.remove(dt)
+                snd = d.find("sound")
+                if snd is not None and snd.get("tempo"):
+                    try:
+                        ok = 20 <= float(snd.get("tempo")) <= 400
+                    except ValueError:
+                        ok = False
+                    if not ok or bad:
+                        bad.append(snd.get("tempo"))
+                        del snd.attrib["tempo"]
+                        if not snd.attrib:
+                            d.remove(snd)
+                if bad:
+                    if d.find("direction-type") is None and d.find("sound") is None:
+                        m.remove(d)
+                    notes.append(Note(f"Measure {{m}}: a tempo mark was misread ('{bad[0]}'); "
+                                      "it was ignored.", _ref(m)))
+        for snd in part.iter("sound"):  # <sound tempo> outside directions
+            t = snd.get("tempo")
+            if t is not None:
+                try:
+                    ok = 20 <= float(t) <= 400
+                except ValueError:
+                    ok = False
+                if not ok:
+                    del snd.attrib["tempo"]
+    return notes
+
+
+def _order_ties(root: ET.Element) -> None:
+    """In the middle note of a tie chain, Verovio needs the 'stop' tie before
+    the 'start' one (MusicXML allows either order); otherwise the chain's last
+    note is silent while the page still lights it."""
+    for note in root.iter("note"):
+        for parent, tag in ((note, "tie"), (note.find("notations"), "tied")):
+            if parent is None:
+                continue
+            ties = parent.findall(tag)
+            if len(ties) < 2:
+                continue
+            first = list(parent).index(ties[0])
+            for t in ties:
+                parent.remove(t)
+            for k, t in enumerate(sorted(ties, key=lambda t: t.get("type") != "stop")):
+                parent.insert(first + k, t)
 
 
 def _normalize_repeat_barlines(root: ET.Element) -> None:
@@ -233,7 +361,7 @@ def _insert_after_header(m: ET.Element, el: ET.Element) -> None:
     m.insert(idx, el)
 
 
-def _implied_forward_repeats(root: ET.Element) -> list[str]:
+def _implied_forward_repeats(root: ET.Element) -> list[Note]:
     """'A :| B :|' means A A B B. Without a start-repeat before B, Verovio
     jumps back to the beginning and plays A A B A B."""
     notes = []
@@ -262,10 +390,8 @@ def _implied_forward_repeats(root: ET.Element) -> list[str]:
                 ET.SubElement(bl, "bar-style").text = "heavy-light"
                 ET.SubElement(bl, "repeat", {"direction": "forward"})
                 _insert_after_header(ms[t], bl)
-        notes.append(
-            f"Measure {_num(measures0[t], t)}: assumed a start-repeat here, so the next end-repeat "
-            "goes back to this measure rather than to the beginning."
-        )
+        notes.append(Note("Measure {m}: assumed a start-repeat here, so the next end-repeat goes "
+                          "back to this measure rather than to the beginning.", _ref(measures0[t])))
     return notes
 
 
@@ -278,11 +404,12 @@ def _starts_system(m: ET.Element) -> bool:
     return p is not None and (p.get("new-system") == "yes" or p.get("new-page") == "yes")
 
 
-def _drop_empty_measures(root: ET.Element) -> list[str]:
+def _drop_empty_measures(root: ET.Element) -> list[Note]:
     """Audiveris sometimes turns a courtesy key/time signature at the end of a
     line into an extra, empty measure. Played, it is a silent bar, and every
     later measure number is one too high. Remove it when the next measure starts
-    a new line and restates a key or time signature; carry its signatures over."""
+    a new line and restates a key or time signature; carry its signatures,
+    directions and left barline (a start-repeat) over."""
     parts = _parts(root)
     if not parts:
         return []
@@ -290,7 +417,8 @@ def _drop_empty_measures(root: ET.Element) -> list[str]:
     n = len(measures0)
     drop = []
     for i in range(1, n - 1):
-        if any(i >= len(p.findall("measure")) or _has_music(p.findall("measure")[i]) for p in parts):
+        if any(i + 1 >= len(p.findall("measure")) or _has_music(p.findall("measure")[i])
+               for p in parts):
             continue
         nxt = measures0[i + 1]
         restated = any(a.find("key") is not None or a.find("time") is not None
@@ -299,7 +427,8 @@ def _drop_empty_measures(root: ET.Element) -> list[str]:
             drop.append(i)
     if not drop:
         return []
-    labels = [_num(measures0[i - 1], i - 1) for i in drop]
+    notes = [Note("Removed an empty measure after measure {m} (OMR made one out of a courtesy "
+                  "signature at the end of a line).", _ref(measures0[i - 1])) for i in drop]
     for part in parts:
         ms = part.findall("measure")
         for j, m in enumerate(ms):
@@ -308,55 +437,63 @@ def _drop_empty_measures(root: ET.Element) -> list[str]:
                 m.set("number", str(int(m.get("number")) - shift))
         for i in reversed(drop):
             empty, nxt = ms[i], ms[i + 1]
-            carried = [c for c in empty if c.tag in ("attributes", "direction")]
+            carried = [c for c in empty if c.tag in ("attributes", "direction")
+                       or (c.tag == "barline" and (c.get("location") or "right") == "left")]
             for k, c in enumerate(carried):
                 nxt.insert(k, c)
             part.remove(empty)
-    return [
-        f"Removed an empty measure after measure {label} "
-        "(OMR made one out of a courtesy signature at the end of a line)."
-        for label in labels
-    ]
+    return notes
 
 
 _TEMPO_WORDS = re.compile(r"^(?P<pre>[^\d]{0,40}?)(?P<n>\d{2,3})\s*\)?\s*$")
+_CATALOGUE = re.compile(r"(?:^|[\s(])(?:K|KV|L|D|Hob|BWV|Op|No|N[º°o]|m|mm|bar|bars|Psalm|Ps|p|pp)"
+                        r"\.?\s*$|#\s*$", re.IGNORECASE)
 
 
-def _tempo_from_words(root: ET.Element) -> list[str]:
+def _tempo_from_words(root: ET.Element) -> list[Note]:
     """Audiveris often reads a metronome mark as plain text ('= 132',
-    'Allegro 144)', 'z 100'). Turn such text into a tempo."""
+    'Allegro 144)', 'z 100'). Turn such text into a tempo, in quarter notes
+    per minute: '♩. = 60' is 90."""
     notes = []
     for part in _parts(root)[:1]:
-        for i, m in enumerate(part.findall("measure")):
+        for m in part.findall("measure"):
             for d in m.findall("direction"):
-                if d.find("sound") is not None and d.find("sound").get("tempo"):
-                    continue
-                if d.find(".//metronome") is not None:
+                snd = d.find("sound")
+                if (snd is not None and snd.get("tempo")) or d.find(".//metronome") is not None:
                     continue
                 text = " ".join((w.text or "") for w in d.iter("words")).strip()
                 mt = _TEMPO_WORDS.match(text) if text else None
                 if not mt:
                     continue
-                bpm = int(mt.group("n"))
+                n = int(mt.group("n"))
                 pre = mt.group("pre")
+                if "=" not in pre and ("(" not in text and ")" not in text
+                                       and len(pre.strip()) > 2 or _CATALOGUE.search(pre)):
+                    continue
+                unit = 1.0
+                if re.search(r"\.\s*=", pre):
+                    unit = 1.5  # dotted beat
+                elif re.search(r"[𝅗𝅥𝅗]\s*=", pre):
+                    unit = 2.0  # half note
+                elif re.search(r"[♪𝅘𝅥𝅮]\s*=", pre):
+                    unit = 0.5  # eighth note
+                bpm = round(n * unit)
                 if not 30 <= bpm <= 300:
                     continue
-                if not ("=" in text or "(" in text or ")" in text or len(pre.strip()) <= 2):
-                    continue
-                snd = d.find("sound")
                 if snd is None:
                     snd = ET.SubElement(d, "sound")
                 snd.set("tempo", str(bpm))
-                notes.append(f"Measure {_num(m, i)}: read the text '{text}' as a tempo of {bpm} BPM.")
+                notes.append(Note(f"Measure {{m}}: read the text '{text}' as a tempo of {bpm} "
+                                  "quarter notes per minute.", _ref(m)))
     return notes
 
 
-_DC = re.compile(r"\bD\.\s*C\.|\bda\s*capo\b|\bal\s+fine\b", re.IGNORECASE)
+_DC = re.compile(r"\bD\.?\s*C\.(?:\s|$)|\bda\s*capo\b|^\s*al\s+fine\b", re.IGNORECASE)
 _FINE = re.compile(r"^\s*fine\s*$", re.IGNORECASE)
 _DS_CODA = re.compile(r"\bD\.\s*S\.|\bdal\s*segno\b|\bcoda\b|\bsegno\b", re.IGNORECASE)
 
 
-def _jumps(root: ET.Element) -> list[str]:
+def _jumps(root: ET.Element) -> list[Note]:
     """Make 'D.C. al Fine' playable; warn about D.S./Coda, which we cannot."""
     parts = _parts(root)
     if not parts or any(s.get("dacapo") or s.get("dalsegno") for s in root.iter("sound")):
@@ -364,45 +501,45 @@ def _jumps(root: ET.Element) -> list[str]:
     measures = parts[0].findall("measure")
     notes = []
     dc_at = fine_at = None
+    al_fine = False
     for i, m in enumerate(measures):
         for d in m.findall("direction"):
             text = " ".join((w.text or "") for w in d.iter("words"))
             if _DS_CODA.search(text):
-                notes.append(f"Measure {_num(m, i)}: a D.S./Coda instruction ('{text.strip()}') was "
-                             "read but is not played; the audio plays straight through.")
+                notes.append(Note(f"Measure {{m}}: a D.S./Coda instruction ('{text.strip()}') was "
+                                  "read but is not played; the audio plays straight through.",
+                                  _ref(m)))
             elif _DC.search(text) and dc_at is None:
                 dc_at = i
+                al_fine = bool(re.search(r"\bfine\b", text, re.IGNORECASE))
             elif _FINE.match(text) and fine_at is None:
                 fine_at = i
     if dc_at is None:
         return notes
-    if fine_at is None or fine_at >= dc_at:
+    if fine_at is not None and fine_at >= dc_at:
+        fine_at = None
+    if fine_at is None and al_fine:
+        # 'al Fine' but the word Fine itself was not read: the Fine is
+        # usually at the last final barline (not an end-repeat) before the D.C.
         fine_at = next((i for i in range(dc_at - 1, 0, -1)
-                        if _bar_style(measures[i], "right") in ("light-heavy", "heavy-heavy")), None)
+                        if _bar_style(measures[i], "right") in ("light-heavy", "heavy-heavy")
+                        and not _repeat(measures[i], "right", "backward")), None)
     d = ET.SubElement(measures[dc_at], "direction")
-    ET.SubElement(d, "direction-type").append(_words("D.C."))
     ET.SubElement(d, "sound", {"dacapo": "yes"})
-    msg = f"Measure {_num(measures[dc_at], dc_at)}: playing the 'D.C.' (back to the beginning)"
+    text = "Measure {m}: playing the 'D.C.' (back to the beginning)"
     if fine_at is not None:
         d = ET.SubElement(measures[fine_at], "direction")
-        ET.SubElement(d, "direction-type").append(_words(""))
         ET.SubElement(d, "sound", {"fine": "yes"})
-        msg += f", ending at the Fine in measure {_num(measures[fine_at], fine_at)}"
-    notes.append(msg + ". Check that this is right.")
+        text += f", ending at the Fine at the end of measure {_num(measures[fine_at], fine_at)}"
+    notes.append(Note(text + ". Check that this is right.", _ref(measures[dc_at])))
     return notes
-
-
-def _words(text: str) -> ET.Element:
-    w = ET.Element("words")
-    w.text = text
-    return w
 
 
 _KEY_NAMES = {-7: "C♭", -6: "G♭", -5: "D♭", -4: "A♭", -3: "E♭", -2: "B♭", -1: "F", 0: "C",
               1: "G", 2: "D", 3: "A", 4: "E", 5: "B", 6: "F♯", 7: "C♯"}
 
 
-def _check_keys(root: ET.Element) -> list[str]:
+def _check_keys(root: ET.Element) -> list[Note]:
     """Different key signatures on the staves of one piano part are almost
     always a misread."""
     notes = []
@@ -419,16 +556,17 @@ def _check_keys(root: ET.Element) -> list[str]:
         if len(set(staff_keys.values())) > 1:
             desc = " vs ".join(f"{_KEY_NAMES.get(f, f)} major (staff {n})"
                                for n, f in sorted(staff_keys.items()))
-            notes.append(f"The staves start in different keys ({desc}); one key signature "
-                         "was probably misread.")
+            notes.append(Note(f"The staves start in different keys ({desc}); one key signature "
+                              "was probably misread."))
     return notes
 
 
 # ---------------------------------------------------------------- movements
 
-_ATTR_ORDER = ["footnote", "level", "divisions", "key", "time", "staves", "part-symbol",
-               "instruments", "clef", "staff-details", "transpose", "for-part", "directive",
-               "measure-style"]
+# Attributes that stay in force until changed. (measure-style, directive and
+# footnote apply only where they are written, so they are not carried over.)
+_ATTR_ORDER = ["divisions", "key", "time", "staves", "part-symbol", "instruments", "clef",
+               "staff-details", "transpose", "for-part"]
 
 
 def split_movements(root: ET.Element) -> list[ET.Element]:
@@ -437,17 +575,23 @@ def split_movements(root: ET.Element) -> list[ET.Element]:
     Audiveris starts a new movement only at an indented first line of a page,
     so a page holding several short pieces comes out as one score. A final
     barline followed by a measure that restates the time signature on a new
-    line marks the start of the next piece.
+    line marks the start of the next piece, unless a D.C. after it points back
+    to a Fine before it (then it is one piece in several sections).
     """
     parts = _parts(root)
     measures0 = parts[0].findall("measure")
+    fine = [i for i, m in enumerate(measures0)
+            if any(s.get("fine") == "yes" for s in m.iter("sound"))]
+    dacapo = [i for i, m in enumerate(measures0)
+              if any(s.get("dacapo") == "yes" or s.get("dalsegno") for s in m.iter("sound"))]
     cuts = []
     for i in range(2, len(measures0) - 1):
         prev, m = measures0[i - 1], measures0[i]
         restates_time = any(a.find("time") is not None for a in m.findall("attributes"))
+        spans_jump = any(f < i for f in fine) and any(d >= i for d in dacapo)
         if (_bar_style(prev, "right") in ("light-heavy", "heavy-heavy") and restates_time
                 and _starts_system(m) and not _repeat(prev, "right", "backward")
-                and (not cuts or i - cuts[-1] >= 2)):
+                and not spans_jump and (not cuts or i - cuts[-1] >= 2)):
             cuts.append(i)
     if not cuts:
         return [root]
@@ -489,22 +633,28 @@ def _attribute_state(measures: list[ET.Element]) -> dict[tuple[str, str], ET.Ele
     for m in measures:
         for a in m.findall("attributes"):
             for c in a:
-                state[(c.tag, c.get("number", ""))] = c
+                if c.tag in _ATTR_ORDER:
+                    state[(c.tag, c.get("number", ""))] = c
     return state
 
 
 def _prepend_state(m: ET.Element, state: dict[tuple[str, str], ET.Element]) -> None:
     own = m.find("attributes")
     merged = dict(state)
+    extra = []
     if own is not None:
         for c in own:
-            merged[(c.tag, c.get("number", ""))] = c
+            if c.tag in _ATTR_ORDER:
+                merged[(c.tag, c.get("number", ""))] = c
+            else:
+                extra.append(c)
         m.remove(own)
     attrs = ET.Element("attributes")
     for tag in _ATTR_ORDER:
         for (t, _n), el in sorted(merged.items(), key=lambda kv: kv[0][1]):
             if t == tag:
                 attrs.append(copy.deepcopy(el))
+    attrs.extend(extra)
     idx = 1 if len(m) and m[0].tag == "print" else 0
     m.insert(idx, attrs)
 
@@ -521,8 +671,11 @@ def set_time(root: ET.Element, beats: int, beat_type: int) -> bool:
     """Give the score a time signature if OMR found none. True if one was added."""
     if root.find(".//time") is not None:
         return False
+    added = False
     for part in _parts(root):
         first = part.find("measure")
+        if first is None:
+            continue
         attrs = first.find("attributes")
         if attrs is None:
             attrs = ET.Element("attributes")
@@ -530,10 +683,10 @@ def set_time(root: ET.Element, beats: int, beat_type: int) -> bool:
         t = ET.Element("time")
         ET.SubElement(t, "beats").text = str(beats)
         ET.SubElement(t, "beat-type").text = str(beat_type)
-        children = list(attrs)
-        pos = sum(1 for c in children if c.tag in ("footnote", "level", "divisions", "key"))
+        pos = sum(1 for c in attrs if c.tag in ("footnote", "level", "divisions", "key"))
         attrs.insert(pos, t)
-    return True
+        added = True
+    return added
 
 
 # ---------------------------------------------------------------- repair

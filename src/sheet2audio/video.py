@@ -98,8 +98,11 @@ def plan_frames(movements: list[VideoMovement]) -> tuple[list[str], list[_Frame]
     """List the (screen, lit notes) state over time for all movements."""
     pages: list[str] = []
     frames: list[_Frame] = []
-    for mv in movements:
+    for k, mv in enumerate(movements):
         mv_pages, timemap = mv.pages, mv.timemap
+        # A movement's trailing events (e.g. the end of a final rest) can fall
+        # after the next movement has started; they must not flip the screen back.
+        until = movements[k + 1].offset_s if k + 1 < len(movements) else float("inf")
         first = len(pages)
         page_of: dict[str, int] = {}
         for i, svg in enumerate(mv_pages):
@@ -116,7 +119,9 @@ def plan_frames(movements: list[VideoMovement]) -> tuple[list[str], list[_Frame]
                 page = page_of[e["measureOn"]]
             elif e.get("on"):
                 page = page_of.get(e["on"][0], page)
-            frames.append(_Frame(mv.offset_s + e["tstamp"] / 1000.0, page, frozenset(active)))
+            start = mv.offset_s + e["tstamp"] / 1000.0
+            if start < until:
+                frames.append(_Frame(start, page, frozenset(active)))
     # Merge frames that start together or show the same thing.
     merged: list[_Frame] = []
     for f in sorted(frames, key=lambda f: f.start):
@@ -190,6 +195,7 @@ def render_video(
         lines.append(f"file '{png_of[(frames[-1].page, frames[-1].active)].name}'")
         (tmp / "frames.ffconcat").write_text("\n".join(lines) + "\n")
 
+        part = dest.with_name(f".{dest.stem}.partial{dest.suffix}")
         cmd = [
             str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
             "-f", "concat", "-safe", "0", "-i", str(tmp / "frames.ffconcat"),
@@ -202,10 +208,14 @@ def render_video(
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
             "-t", f"{end:.3f}",
-            str(dest),
+            str(part),
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise VideoError(f"FFmpeg could not write the video:\n{proc.stderr[-2000:]}")
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise VideoError(f"FFmpeg could not write the video:\n{proc.stderr[-2000:]}")
+            os.replace(part, dest)
+        finally:
+            part.unlink(missing_ok=True)
     return len(png_of)
 

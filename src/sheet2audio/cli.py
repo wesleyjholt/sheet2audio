@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import argparse
 import functools
+import hashlib
 import http.server
 import json
 import math
+import os
 import re
 import shlex
 import signal
@@ -23,10 +25,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 
 from . import musicxml, omr, synth, tools
 from .render import MovementJob, RenderError, combine_midi, process_movements
+from .video import VideoError, VideoMovement, render_video
 from .viewer import write_viewer
 
 MOVEMENT_GAP_S = 2.0
@@ -130,50 +134,88 @@ class _Log:
             print(f"[{time.monotonic() - self.t0:5.1f}s] {msg}", file=sys.stderr, flush=True)
 
 
+def _same(a: Path, b: Path) -> bool:
+    """Same file on disk (also on case-insensitive file systems)."""
+    try:
+        return a.exists() and b.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def _sha256(p: Path) -> str:
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def _read_report(folder: Path) -> dict:
+    try:
+        rep = json.loads((folder / "report.json").read_text())
+        return rep if isinstance(rep, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _book_run_dir(src: Path) -> Path | None:
+    """The folder of the earlier sheet2audio run that wrote this Audiveris
+    book (<name>_sheet2audio/omr/score.omr), if it is one."""
+    if src.suffix.lower() != omr.BOOK_SUFFIX or src.parent.name != "omr":
+        return None
+    run_dir = src.parent.parent
+    rep = _read_report(run_dir)
+    book = rep.get("audiveris_book")
+    if isinstance(rep.get("stem"), str) and isinstance(book, str) and _same(Path(book), src):
+        return run_dir
+    return None
+
+
 def _default_outdir(src: Path) -> Path:
-    # For a book written by an earlier run (<name>_sheet2audio/omr/score.omr),
-    # write next to that run's results.
-    if src.suffix.lower() == omr.BOOK_SUFFIX and src.parent.name == "omr":
-        return src.parent.parent
-    return src.with_name(f"{src.stem}_sheet2audio")
+    return _book_run_dir(src) or src.with_name(f"{src.stem}_sheet2audio")
 
 
-def _stem_for(src: Path, outdir: Path) -> str:
+def _stem_for(src: Path) -> str:
     """Output file names. A book from an earlier run keeps that run's names."""
-    if src.suffix.lower() == omr.BOOK_SUFFIX and src.parent.name == "omr":
-        try:
-            stem = json.loads((outdir / "report.json").read_text()).get("stem")
-            if isinstance(stem, str) and stem and "/" not in stem:
-                return stem
-        except (OSError, ValueError, AttributeError):
-            pass
-        name = outdir.name
-        return name[: -len("_sheet2audio")] if name.endswith("_sheet2audio") else "score"
+    run_dir = _book_run_dir(src)
+    if run_dir is not None:
+        stem = _read_report(run_dir)["stem"]
+        if stem and "/" not in stem and "\\" not in stem:
+            return stem
     return src.stem
 
 
-_OUR_SUFFIXES = (".html", ".mid", ".mp4", ".musicxml", *(f".{f}" for f in synth.FORMATS))
-
-
-def _clean_stale(outdir: Path, stem: str, keep: Path) -> None:
-    """Remove what an earlier run into this folder left behind, so old files
-    cannot be mistaken for this run's results. Never touches `keep` (the input)."""
-    doomed = [outdir / "report.json", outdir / "omr" / "audiveris.log"]
-    doomed += [outdir / f"{stem}{s}" for s in _OUR_SUFFIXES]
-    doomed += list(outdir.glob(f"{glob_escape(stem)}.mvt*.musicxml"))
-    doomed += list((outdir / "omr").glob("score*.mxl"))
-    if keep.suffix.lower() != omr.BOOK_SUFFIX:
-        doomed.append(outdir / "omr" / "score.omr")
+def _clean_stale(outdir: Path, keep: Path, will_omr: bool, notes: list[str]) -> None:
+    """Remove what the previous run into this folder produced (as listed in
+    its report.json), so old files cannot be mistaken for this run's results.
+    Never removes `keep` (the input), nor anything the report does not list,
+    nor an Audiveris book that was changed after it was written."""
+    prev = _read_report(outdir)
+    doomed: list[Path] = [outdir / "report.json"]
+    for key in ("midi", "viewer", "video", "audiveris_log"):
+        if isinstance(prev.get(key), str):
+            doomed.append(Path(prev[key]))
+    audio = prev.get("audio")
+    if isinstance(audio, dict):
+        doomed += [Path(v) for v in audio.values() if isinstance(v, str)]
+    if isinstance(prev.get("musicxml"), list):
+        doomed += [Path(v) for v in prev["musicxml"] if isinstance(v, str)]
+    if will_omr:  # run_audiveris writes these afresh
+        doomed += list((outdir / "omr").glob("score*.mxl")) + [outdir / "omr" / "audiveris.log"]
+        book = outdir / "omr" / "score.omr"
+        if book.is_file() and not _same(book, keep):
+            recorded = prev.get("audiveris_book_sha256")
+            if recorded and _same(Path(prev.get("audiveris_book", "")), book) \
+                    and recorded == _sha256(book):
+                doomed.append(book)
+            else:
+                kept = book.with_name(f"score.{time.strftime('%Y%m%d-%H%M%S')}.omr")
+                book.rename(kept)
+                notes.append(f"The earlier Audiveris book had been changed, so it was kept as "
+                             f"omr/{kept.name}.")
+    root = outdir.resolve()
     for p in doomed:
         try:
-            if p.is_file() and p.resolve() != keep.resolve():
+            if p.is_file() and root in p.resolve().parents and not _same(p, keep):
                 p.unlink()
         except OSError:
             pass
-
-
-def glob_escape(s: str) -> str:
-    return re.sub(r"([*?\[])", r"[\1]", s)
 
 
 def run(argv: list[str] | None = None) -> dict:
@@ -197,7 +239,7 @@ def run(argv: list[str] | None = None) -> dict:
     outdir = (a.outdir.expanduser().absolute() if a.outdir else _default_outdir(src))
     if outdir.exists() and not outdir.is_dir():
         raise UsageError(f"the output path {outdir} exists and is not a folder.")
-    stem = _stem_for(src, outdir)
+    stem = _stem_for(src)
 
     # Resolve every tool before any slow work, so a missing one fails fast.
     fluidsynth = tools.find_fluidsynth()
@@ -205,20 +247,38 @@ def run(argv: list[str] | None = None) -> dict:
     soundfont = tools.find_soundfont(a.soundfont)
     codecs = synth.plan_codecs(ffmpeg, a.formats + (["mp3"] if not a.no_viewer else []))
     audiveris = tools.find_audiveris(a.audiveris) if suffix not in omr.MUSICXML_SUFFIXES else None
-    rsvg = None if a.no_video else tools.find_rsvg()
     notes: list[str] = []
+    rsvg = None if a.no_video else tools.find_rsvg()
     if not a.no_video and rsvg is None:
         notes.append("No MP4 video: install librsvg (brew install librsvg) to get one.")
+    elif rsvg is not None and not {"libx264", "aac"} <= synth.encoders(ffmpeg):
+        rsvg = None
+        notes.append("No MP4 video: this FFmpeg has no H.264 (libx264) or AAC encoder.")
 
     try:
         outdir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         raise UsageError(f"cannot create the output folder {outdir}: {e.strerror}") from None
-    _clean_stale(outdir, stem, src)
+    _clean_stale(outdir, src, audiveris is not None, notes)
     report: dict = {"input": str(src), "outdir": str(outdir), "stem": stem,
                     "soundfont": str(soundfont), "status": "running"}
     _write_report(outdir, report)
+    try:
+        _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codecs,
+             audiveris, rsvg, notes, report)
+    except BaseException as e:
+        interrupted = isinstance(e, (KeyboardInterrupt, SystemExit))
+        report["status"] = "interrupted" if interrupted else "failed"
+        if not interrupted:
+            report["error"] = str(e)
+        report["notes"] = notes
+        _write_report(outdir, report)
+        raise
+    return report
 
+
+def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codecs, audiveris,
+         rsvg, notes, report) -> None:
     # 1. Optical music recognition
     pages = None
     if audiveris is None:
@@ -231,27 +291,37 @@ def run(argv: list[str] | None = None) -> dict:
         pages = res.pages
         notes += res.notes
         report["audiveris_log"] = str(res.log)
-        if res.book:
-            report["audiveris_book"] = str(res.book)
+        book = res.book or (src if suffix == omr.BOOK_SUFFIX else None)
+        if book:
+            report["audiveris_book"] = str(book)
+            report["audiveris_book_sha256"] = _sha256(book)
         report["audiveris_warnings"] = omr.log_warnings(res.log)
 
     # 2. Clean up, split merged pieces
-    roots = []
+    roots, file_notes = [], []
     for mf in movement_files:
         root = musicxml.read_musicxml(mf)
-        notes += musicxml.sanitize(root, src.name)
+        musicxml.tag_measures(root)
+        sn = musicxml.sanitize(root, src.name)
         if a.time and musicxml.set_time(root, *a.time):
             notes.append(f"No time signature was read; using {a.time[0]}/{a.time[1]} as asked.")
         pieces = musicxml.split_movements(root)
         if len(pieces) > 1:
             notes.append(f"Found {len(pieces)} separate pieces on the same page(s); each gets its "
                          "own tempo, with a short pause between them.")
+        for piece in pieces:
+            sn += musicxml.close_octave_lines(piece)
+        file_notes.append((sn, len(roots), pieces))
         roots += pieces
     multi = len(roots) > 1
     titles = []
     for i, root in enumerate(roots, 1):
         t = musicxml.title_of(root) if multi else None
         titles.append(t if t and t not in titles else (f"Movement {i}" if multi else stem))
+    for sn, first, pieces in file_notes:
+        notes += musicxml.resolve_notes(sn, pieces, titles[first:first + len(pieces)])
+    for root in roots:
+        musicxml.untag(root)
 
     # 3. Repair and engrave each movement (in child processes)
     log.step(f"Engraving {len(roots)} movement(s) with Verovio")
@@ -270,8 +340,8 @@ def run(argv: list[str] | None = None) -> dict:
         notes += [note(n) for n in res_i.notes + res_i.rendered.warnings]
         name = f"{stem}.mvt{i}.musicxml" if multi else f"{stem}.musicxml"
         path = outdir / name
-        if path.resolve() == src.resolve():
-            path = outdir / name.replace(".musicxml", ".fixed.musicxml")
+        if _same(path, src):
+            path = outdir / (name[: -len(".musicxml")] + ".fixed.musicxml")
         path.write_bytes(res_i.xml)
         xml_paths.append(path)
         r = res_i.rendered
@@ -282,11 +352,12 @@ def run(argv: list[str] | None = None) -> dict:
         if not r.has_tempo and a.bpm is None:
             notes.append(note(f"no tempo mark was read, so it plays at {r.bpm:g} BPM; "
                               "use --bpm to change it."))
-    total_notes = sum(r.note_count for r in rendered)
-    if total_notes == 0:
+    report["musicxml"] = [str(p) for p in xml_paths]
+    if sum(r.note_count for r in rendered) == 0:
+        hint = (f", or open {outdir / 'omr' / 'score.omr'} in Audiveris to see what it found"
+                if audiveris is not None else "")
         raise UsageError("no notes were recognised. If this is a scan, try a cleaner or "
-                         f"higher-resolution one (300 dpi), or open {outdir / 'omr'} in Audiveris "
-                         "to see what it found.")
+                         f"higher-resolution one (300 dpi){hint}.")
     measures = sum(len(musicxml.read_musicxml(p).find("part").findall("measure")) for p in xml_paths)
     if pages and measures < 3 * pages:
         notes.append(f"Only {measures} bars were recognised on {pages} page(s); parts of the "
@@ -296,40 +367,40 @@ def run(argv: list[str] | None = None) -> dict:
     offsets, t = [], 0.0
     for r in rendered:
         offsets.append(t)
-        t += r.duration_s + MOVEMENT_GAP_S
-    end_s = offsets[-1] + rendered[-1].duration_s + TAIL_S
+        t += max(r.duration_s, r.ring_s) + MOVEMENT_GAP_S
+    end_s = offsets[-1] + max(rendered[-1].duration_s, rendered[-1].ring_s) + TAIL_S
     midi_path = outdir / f"{stem}.mid"
     midi_path.write_bytes(combine_midi([(r.midi, off, r.tempo_factor)
                                         for r, off in zip(rendered, offsets)]))
-
-    # 5. Audio, video, play-along page
-    log.step(f"Synthesizing audio with FluidSynth ({soundfont.name})")
+    report["midi"] = str(midi_path)
     report["movements"] = [
         {"title": r.title, "notes": r.note_count, "pages": len(r.svgs),
          "duration_s": round(r.duration_s, 3), "offset_s": round(off, 3),
          "start_bpm": round(r.bpm, 3), "tempo_mark_read": r.has_tempo}
         for r, off in zip(rendered, offsets)]
-    report["midi"] = str(midi_path)
-    report["musicxml"] = [str(p) for p in xml_paths]
+
+    # 5. Audio, video, play-along page
+    log.step(f"Synthesizing audio with FluidSynth ({soundfont.name})")
     with tempfile.TemporaryDirectory(prefix="sheet2audio-") as tmp:
         raw = Path(tmp) / "raw.wav"
         synth.render_wav(fluidsynth, soundfont, midi_path, raw)
         outputs = {fmt: outdir / f"{stem}.{fmt}" for fmt in a.formats}
+        report["audio"] = {k: str(v) for k, v in outputs.items()}
         viewer_audio = outputs.get("mp3")
         if not a.no_viewer and viewer_audio is None:
             viewer_audio = Path(tmp) / f"{stem}.mp3"
         gain = synth.encode(ffmpeg, raw, {**outputs, **({"mp3": viewer_audio} if viewer_audio else {})},
                             codecs, end_s)
-        report["audio"] = {k: str(v) for k, v in outputs.items()}
         if rsvg is not None:
-            from .video import VideoMovement, render_video
-
             log.step("Drawing the score video")
             mp4 = outdir / f"{stem}.mp4"
-            render_video([VideoMovement(r.svgs_video, r.timemap, off)
-                          for r, off in zip(rendered, offsets)],
-                         raw, synth.audio_filter(gain, end_s), mp4, ffmpeg, rsvg, end_s)
-            report["video"] = str(mp4)
+            try:
+                render_video([VideoMovement(r.svgs_video, r.timemap, off)
+                              for r, off in zip(rendered, offsets)],
+                             raw, synth.audio_filter(gain, end_s), mp4, ffmpeg, rsvg, end_s)
+                report["video"] = str(mp4)
+            except VideoError as e:
+                notes.append(f"No MP4 video: {str(e).splitlines()[0]}")
         if not a.no_viewer:
             html_path = outdir / f"{stem}.html"
             link = a.link_audio and "mp3" in outputs
@@ -346,17 +417,16 @@ def run(argv: list[str] | None = None) -> dict:
     if not a.quiet:
         _print_summary(report, notes, xml_paths)
     if a.open and "viewer" in report:
-        _open(Path(report["viewer"]))
+        _launch(["open" if sys.platform == "darwin" else "xdg-open", report["viewer"]], "the page")
     if a.musescore:
         ms = tools.find_musescore()
         if ms is None:
             print("MuseScore was not found (free download: https://musescore.org).", file=sys.stderr)
         else:
-            subprocess.Popen([str(ms), *map(str, xml_paths)],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _launch([str(ms), *map(str, xml_paths)], "MuseScore")
     if a.serve is not None:
-        _serve(outdir, a.serve, Path(report.get("viewer", "")).name, Path(report.get("video", "")).name)
-    return report
+        _serve(outdir, a.serve, Path(report.get("viewer", "")).name,
+               Path(report.get("video", "")).name)
 
 
 def _write_report(outdir: Path, report: dict) -> None:
@@ -383,9 +453,11 @@ def _print_summary(report: dict, notes: list[str], xml_paths: list[Path]) -> Non
               f"or fix {shlex.quote(xml_paths[0].name)} in MuseScore and run sheet2audio on it.")
 
 
-def _open(path: Path) -> None:
-    opener = "open" if sys.platform == "darwin" else "xdg-open"
-    subprocess.Popen([opener, str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def _launch(cmd: list[str], what: str) -> None:
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        print(f"warning: could not open {what}: {e.strerror or e}", file=sys.stderr)
 
 
 def _lan_address() -> str | None:
@@ -397,19 +469,31 @@ def _lan_address() -> str | None:
         return None
 
 
+class _QuietHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *args) -> None:
+        pass
+
+
+class _QuietServer(http.server.ThreadingHTTPServer):
+    def handle_error(self, request, client_address) -> None:
+        pass  # a phone dropping a connection is not worth a traceback
+
+
 def _serve(outdir: Path, port: int, page: str, video: str) -> None:
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(outdir))
-    handler.log_message = lambda *args, **kw: None
+    handler = functools.partial(_QuietHandler, directory=str(outdir))
     try:
-        httpd = http.server.ThreadingHTTPServer(("0.0.0.0", port), handler)
+        httpd = _QuietServer(("0.0.0.0", port), handler)
     except OSError as e:
         raise UsageError(f"cannot share on port {port}: {e.strerror}. Try --serve 8080.") from None
     ip = _lan_address()
     host = socket.gethostname()
+    page_q, video_q = urllib.parse.quote(page), urllib.parse.quote(video)
     print(f"\nSharing {outdir} on your local network (Ctrl-C to stop).")
     print("Anyone on this Wi-Fi can open these files while this runs. On your phone, open:")
     for h in dict.fromkeys(x for x in (ip, host if host.endswith(".local") else f"{host}.local") if x):
-        print(f"  http://{h}:{port}/{page}" + (f"   (video: http://{h}:{port}/{video})" if video else ""))
+        print(f"  http://{h}:{port}/{page_q}"
+              + (f"   (video: http://{h}:{port}/{video_q})" if video else ""))
+    sys.stdout.flush()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -418,17 +502,20 @@ def _serve(outdir: Path, port: int, page: str, video: str) -> None:
         httpd.server_close()
 
 
-def _on_sigterm(signum, frame):
+def _on_signal(signum, frame):
     raise SystemExit(128 + signum)
 
 
 def main(argv: list[str] | None = None) -> None:
-    signal.signal(signal.SIGTERM, _on_sigterm)  # so temporary folders get cleaned up
+    # Turn termination signals into exceptions, so temporary folders get cleaned up.
+    for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if sig is not None:
+            signal.signal(sig, _on_signal)
     debug = "--debug" in (argv if argv is not None else sys.argv[1:])
     try:
         run(argv)
     except (UsageError, tools.MissingTool, omr.OMRError, synth.SynthError, RenderError,
-            musicxml.MusicXMLError) as e:
+            musicxml.MusicXMLError, VideoError) as e:
         if debug:
             raise
         print(f"error: {e}", file=sys.stderr)

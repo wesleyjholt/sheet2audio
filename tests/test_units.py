@@ -67,6 +67,13 @@ def root_of(xml: bytes) -> ET.Element:
     return mx.parse(xml)
 
 
+def sanitize(root) -> list[str]:
+    mx.tag_measures(root)
+    notes = mx.resolve_notes(mx.sanitize(root), [root], ["t"])
+    mx.untag(root)
+    return notes
+
+
 def lengths(root) -> list[Fraction]:
     return heard_measure_lengths(mx.to_bytes(root))
 
@@ -188,7 +195,7 @@ def _octave(kind):
 
 def test_unterminated_octave_shift_from_audiveris_is_dropped_and_reported():
     root = root_of(score([FULL, _octave("down") + FULL, FULL]))
-    notes = mx.sanitize(root)
+    notes = sanitize(root)
     assert root.find(".//octave-shift") is None
     assert any("8va" in n and "2" in n for n in notes)
     render_musicxml(mx.to_bytes(root), "t")  # would segfault with the open 8va line
@@ -196,7 +203,9 @@ def test_unterminated_octave_shift_from_audiveris_is_dropped_and_reported():
 
 def test_unterminated_octave_shift_from_other_software_is_closed():
     root = root_of(score([FULL, _octave("down") + FULL, FULL], software="MuseScore 4"))
-    mx.sanitize(root)
+    sanitize(root)
+    assert [o.get("type") for o in root.iter("octave-shift")] == ["down"]  # kept by sanitize
+    assert mx.close_octave_lines(root)
     kinds = [o.get("type") for o in root.iter("octave-shift")]
     assert kinds == ["down", "stop"]
     render_musicxml(mx.to_bytes(root), "t")
@@ -206,7 +215,7 @@ def test_repeat_barlines_are_drawn_so_verovio_plays_them():
     a = FULL + barline("right", "light-light", "backward")
     b = barline("left", "light-light", "forward") + FULL
     root = root_of(score([FULL, a, b, FULL + barline("right", "light-heavy", "backward")]))
-    mx.sanitize(root)
+    sanitize(root)
     styles = [bl.findtext("bar-style") for bl in root.iter("barline")]
     assert styles == ["light-heavy", "heavy-light", "light-heavy"]
     r = render_musicxml(mx.to_bytes(root), "t")
@@ -220,7 +229,7 @@ def test_implied_start_repeat():
     a = FULL + barline("right", "light-heavy", "backward")
     b = FULL + barline("right", "light-heavy", "backward")
     root = root_of(score([FULL, a, FULL, b]))
-    notes = mx.sanitize(root)
+    notes = sanitize(root)
     assert any("start-repeat" in n for n in notes)
     r = render_musicxml(mx.to_bytes(root), "t")
     assert abs(r.duration_s - 8 * 1.5) < 0.01  # A A B B, 2 bars each
@@ -231,7 +240,7 @@ def test_empty_courtesy_measure_is_removed_and_numbers_shift():
     xml = score([FULL, "", FULL, FULL], attrs={3: nxt_attr})
     xml = xml.replace(b'<measure number="3">', b'<measure number="3"><print new-system="yes"/>')
     root = root_of(xml)
-    notes = mx.sanitize(root)
+    notes = sanitize(root)
     assert [m.get("number") for m in root.iter("measure")] == ["1", "2", "3"]
     assert any("empty measure" in n for n in notes)
 
@@ -239,12 +248,12 @@ def test_empty_courtesy_measure_is_removed_and_numbers_shift():
 def test_tempo_from_words():
     d = '<direction placement="above"><direction-type><words>= 132</words></direction-type></direction>'
     root = root_of(score([d + FULL, FULL]))
-    notes = mx.sanitize(root)
+    notes = sanitize(root)
     assert root.find(".//sound").get("tempo") == "132"
     assert notes and "132" in notes[0]
     fingering = '<direction><direction-type><words>Op. 100</words></direction-type></direction>'
     root = root_of(score([fingering + FULL, FULL]))
-    mx.sanitize(root)
+    sanitize(root)
     assert root.find(".//sound") is None
 
 
@@ -253,7 +262,7 @@ def test_da_capo_al_fine_is_played():
     dc = ('<direction><direction-type><words>D.C. al Fine</words></direction-type></direction>'
           + FULL + barline("right", "light-heavy"))
     root = root_of(score([FULL, fine, FULL, dc]))
-    notes = mx.sanitize(root)
+    notes = sanitize(root)
     assert any("D.C." in n for n in notes)
     r = render_musicxml(mx.to_bytes(root), "t")
     assert abs(r.duration_s - 6 * 1.5) < 0.01  # 4 bars, then back to bar 1 until the Fine at bar 2
@@ -262,7 +271,7 @@ def test_da_capo_al_fine_is_played():
 def test_different_keys_on_the_two_staves_are_reported():
     xml = score([FULL, FULL]).replace(b"<key><fifths>0</fifths></key>",
                                       b'<key number="1"><fifths>1</fifths></key><key number="2"><fifths>0</fifths></key>')
-    assert any("different keys" in n for n in mx.sanitize(root_of(xml)))
+    assert any("different keys" in n for n in sanitize(root_of(xml)))
 
 
 def test_split_movements_at_final_barline_with_new_time_signature():
@@ -355,3 +364,149 @@ def test_layouts_share_note_ids():
 def test_rend_ids_are_mapped_back():
     tm = [{"tstamp": 0, "on": ["a-rend2", "b"], "measureOn": "m-rend3"}]
     assert _normalize_ids(tm, {"a", "b", "m"})[0] == {"tstamp": 0, "on": ["a", "b"], "measureOn": "m"}
+
+
+# ---------------------------------------------------------------- review regressions
+
+
+def test_start_repeat_survives_dropping_an_empty_courtesy_measure():
+    nxt_attr = "<attributes><key><fifths>1</fifths></key></attributes>"
+    a = FULL + barline("right", "light-heavy", "backward")
+    b = FULL + barline("right", "light-heavy", "backward")
+    xml = score([FULL, a, "", FULL, b], attrs={4: nxt_attr})
+    xml = xml.replace(b'<measure number="4">', b'<measure number="4"><print new-system="yes"/>')
+    root = root_of(xml)
+    sanitize(root)
+    r = render_musicxml(mx.to_bytes(root), "t")
+    assert abs(r.duration_s - 8 * 1.5) < 0.01  # A A B B
+
+
+def test_expression_al_fine_is_not_a_da_capo():
+    dim = '<direction><direction-type><words>dim. al fine</words></direction-type></direction>'
+    root = root_of(score([FULL, dim + FULL, FULL]))
+    assert not any("D.C." in n for n in sanitize(root))
+    assert root.find(".//sound") is None
+
+
+def test_bare_dc_does_not_stop_at_an_end_repeat():
+    a = FULL + barline("right", "light-heavy", "backward")
+    dc = '<direction><direction-type><words>D.C.</words></direction-type></direction>' + FULL
+    root = root_of(score([a, FULL, dc]))
+    sanitize(root)
+    assert not any(s.get("fine") for s in root.iter("sound"))
+
+
+def test_split_keeps_da_capo_and_its_fine_together():
+    new_meter = "<attributes><time><beats>2</beats><beat-type>4</beat-type></time></attributes>"
+    fine = '<direction><direction-type><words>Fine</words></direction-type></direction>'
+    dc = '<direction><direction-type><words>D.C. al Fine</words></direction-type></direction>'
+    two = note("C", 5, 4, "half") + backup(4) + note("C", 3, 4, "half", staff="2")
+    xml = score([FULL, fine + FULL + barline("right", "light-heavy"), two, dc + two],
+                attrs={3: new_meter})
+    xml = xml.replace(b'<measure number="3">', b'<measure number="3"><print new-system="yes"/>')
+    root = root_of(xml)
+    sanitize(root)
+    assert len(mx.split_movements(root)) == 1
+
+
+def test_split_does_not_carry_measure_style():
+    rest_style = ("<attributes><measure-style><multiple-rest>2</multiple-rest></measure-style>"
+                  "</attributes>")
+    new_piece = "<attributes><time><beats>3</beats><beat-type>4</beat-type></time></attributes>"
+    xml = score([FULL, FULL, FULL + barline("right", "light-heavy"), FULL, FULL],
+                attrs={2: rest_style, 4: new_piece})
+    xml = xml.replace(b'<measure number="4">', b'<measure number="4"><print new-system="yes"/>')
+    pieces = mx.split_movements(root_of(xml))
+    assert len(pieces) == 2 and pieces[1].find(".//measure-style") is None
+
+
+def test_octave_lines_closed_per_piece_after_split():
+    new_piece = "<attributes><time><beats>3</beats><beat-type>4</beat-type></time></attributes>"
+    xml = score([FULL, _octave("down") + FULL, FULL + barline("right", "light-heavy"), FULL, FULL],
+                attrs={4: new_piece}, software="MuseScore 4")
+    xml = xml.replace(b'<measure number="4">', b'<measure number="4"><print new-system="yes"/>')
+    root = root_of(xml)
+    sanitize(root)
+    pieces = mx.split_movements(root)
+    for p in pieces:
+        mx.close_octave_lines(p)
+        render_musicxml(mx.to_bytes(p), "t")  # would crash with an open line
+
+
+def test_tempo_words_catalogue_numbers_and_dotted_beats():
+    def tempo_of(words, beats=3):
+        d = f'<direction><direction-type><words>{words}</words></direction-type></direction>'
+        root = root_of(score([d + FULL, FULL], beats=beats))
+        sanitize(root)
+        s = root.find(".//sound")
+        return None if s is None else s.get("tempo")
+    assert tempo_of("K. 283") is None
+    assert tempo_of("L. 33") is None
+    assert tempo_of("#64") is None
+    assert tempo_of("= 132") == "132"
+    assert tempo_of("♩. = 60") == "90"
+
+
+def test_implausible_tempo_mark_is_ignored():
+    d = ('<direction><direction-type><metronome><beat-unit>quarter</beat-unit>'
+         '<per-minute>1oo</per-minute></metronome></direction-type><sound tempo="1"/></direction>')
+    root = root_of(score([d + FULL, FULL]))
+    notes = sanitize(root)
+    assert any("misread" in n for n in notes)
+    r = render_musicxml(mx.to_bytes(root), "t")
+    assert r.base_tempo == 120 and not r.warnings
+
+
+def test_three_note_tie_chain_sounds_to_the_end():
+    def tied(step, types):
+        t = "".join(f'<tie type="{x}"/>' for x in types)
+        n = "".join(f'<tied type="{x}"/>' for x in types)
+        return (f"<note><pitch><step>{step}</step><octave>5</octave></pitch><duration>6</duration>{t}"
+                f"<voice>1</voice><type>half</type><dot/><staff>1</staff><notations>{n}</notations></note>"
+                + backup(6) + note("C", 3, 6, "half", staff="2", dot=True))
+    root = root_of(score([tied("C", ["start"]), tied("C", ["start", "stop"]), tied("C", ["stop"])]))
+    sanitize(root)
+    r = render_musicxml(mx.to_bytes(root), "t")
+    midi = combine_midi([(r.midi, 0.0, 1.0)])
+    t, on, off = 0.0, None, None
+    for m in mido.MidiFile(file=io.BytesIO(midi)):
+        t += m.time
+        if m.type == "note_on" and m.velocity and m.note == 72:
+            on = t
+        elif m.type in ("note_off", "note_on") and m.note == 72 and not getattr(m, "velocity", 0):
+            off = t
+    assert on == 0 and off > 4.4  # held through all three bars (4.5 s)
+
+
+def test_unison_notes_in_two_voices_both_sound():
+    a = _midi([(0, 4, 72)])
+    b = _midi([(0, 1, 72)])
+    merged = mido.MidiFile(ticks_per_beat=480)
+    for data in (a, b):
+        merged.tracks += mido.MidiFile(file=io.BytesIO(data)).tracks
+    buf = io.BytesIO()
+    merged.save(file=buf)
+    out = combine_midi([(buf.getvalue(), 0.0, 1.0)])
+    t, offs = 0.0, []
+    for m in mido.MidiFile(file=io.BytesIO(out)):
+        t += m.time
+        if m.type == "note_off" or (m.type == "note_on" and m.velocity == 0):
+            offs.append(round(t, 3))
+    # struck twice at 0 (released and re-struck), never released at 0.5 s where the
+    # short note ends, released when the long note ends (4 beats at 120 BPM)
+    assert 0.5 not in offs and offs[-1] == 2.0
+
+
+def test_pedal_keeps_the_last_chord_ringing():
+    from sheet2audio.render import _midi_extent
+    mf = mido.MidiFile(ticks_per_beat=480)
+    tr = mido.MidiTrack()
+    mf.tracks.append(tr)
+    tr += [mido.Message("control_change", control=64, value=127),
+           mido.Message("note_on", note=60, velocity=80),
+           mido.Message("note_off", note=60, time=480),
+           mido.Message("control_change", control=64, value=0, time=4 * 480)]
+    buf = io.BytesIO()
+    mf.save(file=buf)
+    last_off, ring, n = _midi_extent(buf.getvalue())
+    assert n == 1 and abs(last_off - 0.5) < 1e-6 and abs(ring - 2.5) < 1e-6

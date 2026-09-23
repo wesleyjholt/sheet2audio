@@ -13,6 +13,7 @@ import base64
 import io
 import multiprocessing
 import re
+import signal
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
@@ -49,6 +50,7 @@ class Rendered:
     tempo_factor: float  # playback speed relative to the score
     has_tempo: bool  # the score states a tempo (else Verovio's default is used)
     duration_s: float  # musical end (last note-off) at the final tempo
+    ring_s: float  # when the last sound stops: later than duration_s if the pedal holds it
     note_count: int
     warnings: list[str] = field(default_factory=list)
 
@@ -155,17 +157,46 @@ def _normalize_ids(timemap: list[dict], svg_ids: set[str]) -> list[dict]:
     return out
 
 
-def _midi_extent(data: bytes) -> tuple[float, int]:
+def _last_note_on(data: bytes) -> float:
+    t = last = 0.0
+    for msg in mido.MidiFile(file=io.BytesIO(data)):
+        t += msg.time
+        if msg.type == "note_on" and msg.velocity > 0:
+            last = t
+    return last
+
+
+PEDAL_RING_MAX_S = 6.0
+
+
+def _midi_extent(data: bytes) -> tuple[float, float, int]:
+    """(last note-off, end of ringing, number of notes), in seconds at the
+    score tempo. A sustain pedal still down at the last note-off keeps the
+    sound going until it is lifted (at most PEDAL_RING_MAX_S longer)."""
     t = last_off = 0.0
     notes = 0
+    pedal: dict[int, bool] = {}
+    pedal_at_end: set[int] = set()
+    lifted: dict[int, float] = {}
     for msg in mido.MidiFile(file=io.BytesIO(data)):
         t += msg.time
         if msg.type == "note_on" and msg.velocity > 0:
             notes += 1
             last_off = max(last_off, t)
         elif msg.type in ("note_off", "note_on"):
-            last_off = max(last_off, t)
-    return last_off, notes
+            if t >= last_off:
+                last_off = t
+                pedal_at_end = {c for c, down in pedal.items() if down}
+                lifted = {}
+        elif msg.type == "control_change" and msg.control == 64:
+            down = msg.value >= 64
+            if pedal.get(msg.channel) and not down and msg.channel in pedal_at_end:
+                lifted.setdefault(msg.channel, t)
+            pedal[msg.channel] = down
+    ring = last_off
+    for c in pedal_at_end:
+        ring = max(ring, min(lifted.get(c, t), last_off + PEDAL_RING_MAX_S))
+    return last_off, ring, notes
 
 
 def render_musicxml(xml: bytes, title: str, bpm: float | None = None, tempo_scale: float = 1.0,
@@ -199,12 +230,20 @@ def render_musicxml(xml: bytes, title: str, bpm: float | None = None, tempo_scal
         video_tk = _toolkit(_options(VIDEO), text)
         svgs_video = [video_tk.renderToSVG(p) for p in range(1, video_tk.getPageCount() + 1)]
 
-    duration, notes = _midi_extent(midi)
+    duration, ring, notes = _midi_extent(midi)
+    # The last note starts at the same moment in the MIDI and in the timemap,
+    # unless something (e.g. an absurd tempo) broke the MIDI timing.
+    tm_last = max((e["tstamp"] for e in raw_timemap if e.get("on")), default=0.0) / 1000.0
+    midi_last = _last_note_on(midi)
+    if notes and abs(tm_last - midi_last) > max(0.05, 0.01 * midi_last):
+        warnings.append(f"The audio and the note highlighting disagree ({midi_last:.1f} s vs "
+                        f"{tm_last:.1f} s for the last note); a tempo mark may have been misread. "
+                        "Try --bpm.")
     return Rendered(
         title=title, svgs=svgs, svgs_narrow=svgs_narrow, svgs_video=svgs_video, midi=midi,
         timemap=timemap, base_tempo=base_tempo, tempo_factor=factor,
         has_tempo=musicxml.has_tempo_mark(xml), duration_s=duration / factor,
-        note_count=notes, warnings=warnings,
+        ring_s=ring / factor, note_count=notes, warnings=warnings,
     )
 
 
@@ -238,12 +277,23 @@ def process_movement(job: MovementJob) -> MovementResult:
     return MovementResult(xml=xml, rendered=r, notes=report.notes)
 
 
+def _ignore_sigint() -> None:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
 def process_movements(jobs: list[MovementJob], workers: int = 4) -> list[MovementResult]:
-    """Run `process_movement` for each job in child processes."""
+    """Run `process_movement` for each job in child processes. Ctrl-C is left
+    to the parent: workers ignore it (they are started while it is ignored,
+    so this holds even before they finish importing)."""
     ctx = multiprocessing.get_context("spawn")
     results: list[MovementResult] = []
-    with ProcessPoolExecutor(max_workers=max(1, min(workers, len(jobs))), mp_context=ctx) as pool:
-        futures = [pool.submit(process_movement, j) for j in jobs]
+    with ProcessPoolExecutor(max_workers=max(1, min(workers, len(jobs))), mp_context=ctx,
+                             initializer=_ignore_sigint) as pool:
+        old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            futures = [pool.submit(process_movement, j) for j in jobs]  # starts the workers
+        finally:
+            signal.signal(signal.SIGINT, old)
         for job, fut in zip(jobs, futures):
             try:
                 results.append(fut.result())
@@ -263,33 +313,62 @@ def combine_midi(parts: list[tuple[bytes, float, float]], tail_s: float = 2.0) -
 
     Every event is re-timed on a fixed 120 BPM grid (1 tick = 1/1920 s) after
     dividing its time by the tempo factor, so the tempo maps of the sources
-    are baked in. An end-of-track `tail_s` after the last event lets the
-    synthesizer finish ringing notes.
+    are baked in. Before each next movement the sustain pedal is lifted and
+    sounding notes are stopped. Where two voices play the same key at once,
+    the key is struck again and released only when the last of them ends
+    (a synthesizer releases every voice on a key at its first note-off).
+    An end-of-track `tail_s` after the last event lets notes finish ringing.
     """
     tpb = 960
     ticks_per_s = tpb * 2  # 120 BPM
     events: list[tuple[int, int, int, mido.Message]] = []
     seq = 0
-    for data, offset, factor in parts:
+    for k, (data, offset, factor) in enumerate(parts):
         t = 0.0
+        channels = set()
         for msg in mido.MidiFile(file=io.BytesIO(data)):
             t += msg.time
             if msg.is_meta or msg.type == "sysex":
                 continue
             seq += 1
-            # note-offs before note-ons on the same tick, so repeated notes retrigger
+            channels.add(getattr(msg, "channel", 0))
             is_off = msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0)
             tick = int(round((offset + t / factor) * ticks_per_s))
             events.append((tick, 0 if is_off else 1, seq, msg))
+        if k + 1 < len(parts):
+            release = int(round((parts[k + 1][1] - 0.01) * ticks_per_s))
+            for ch in sorted(channels):
+                for ctl in (64, 123):  # pedal up, all notes off
+                    seq += 1
+                    events.append((release, 0, seq, mido.Message("control_change", channel=ch,
+                                                                 control=ctl, value=0)))
     events.sort(key=lambda e: e[:3])
     out = mido.MidiFile(type=0, ticks_per_beat=tpb)
     track = mido.MidiTrack()
     out.tracks.append(track)
     track.append(mido.MetaMessage("set_tempo", tempo=500000, time=0))
     now = 0
-    for tick, _, _, msg in events:
+    held: dict[tuple[int, int], int] = {}
+
+    def emit(tick: int, msg: mido.Message) -> None:
+        nonlocal now
         track.append(msg.copy(time=tick - now))
         now = tick
+
+    for tick, _, _, msg in events:
+        if msg.type in ("note_on", "note_off"):
+            key = (msg.channel, msg.note)
+            if msg.type == "note_on" and msg.velocity > 0:
+                if held.get(key, 0) > 0:
+                    emit(tick, mido.Message("note_off", channel=msg.channel, note=msg.note))
+                held[key] = held.get(key, 0) + 1
+            else:
+                held[key] = max(0, held.get(key, 0) - 1)
+                if held[key] > 0:
+                    continue
+        elif msg.type == "control_change" and msg.control == 123:
+            held = {k: 0 for k in held}
+        emit(tick, msg)
     track.append(mido.MetaMessage("end_of_track", time=int(tail_s * ticks_per_s)))
     buf = io.BytesIO()
     out.save(file=buf)
