@@ -143,11 +143,55 @@ def test_short_bar_before_end_repeat_completing_the_pickup_is_left_alone():
     assert rep.padded == []
 
 
-def test_run_of_equally_short_bars_is_reported_as_meter_problem():
+def test_run_of_equally_short_bars_gets_its_missed_time_signature():
     root = root_of(score([FULL, SHORT, SHORT, SHORT, FULL]))
     rep = mx.repair(root, _heard_from_root)
-    assert rep.padded == []
-    assert any("time signature may have been misread" in n for n in rep.notes)
+    assert rep.padded == [] and rep.overfull == []
+    assert any("time signature was probably missed" in n for n in rep.notes)
+    times = [(m.get("number"), m.findtext("attributes/time/beats"))
+             for m in root.iter("measure") if m.find("attributes/time") is not None]
+    assert times == [("1", "3"), ("2", "2"), ("5", "3")]
+
+
+def test_run_of_equally_short_bars_is_only_reported_without_repair():
+    root = root_of(score([FULL, SHORT, SHORT, SHORT, FULL]))
+    rep = mx.repair(root, _heard_from_root, apply=False)
+    assert any("may have been misread" in n for n in rep.notes)
+    assert len([m for m in root.iter("measure") if m.find("attributes/time") is not None]) == 1
+
+
+# A full 3/4 bar as real files write it: the lower staff in voice 5
+FULL5 = (note("C", 5, 2, "quarter") + note("D", 5, 4, "half") + backup(6)
+         + note("C", 3, 6, "half", voice="5", staff="2", dot=True))
+
+
+def test_parts_that_disagree_on_barlines_are_rebarred():
+    # Part 2 missed the barline between bars 2 and 3, so its bar 2 is 6 beats
+    # long; written the way OMR writes it (all of staff 1, back up, staff 2).
+    long_bar = (note("C", 5, 2, "quarter") + note("D", 5, 4, "half")
+                + note("C", 5, 2, "quarter") + note("D", 5, 4, "half") + backup(12)
+                + note("C", 3, 6, "half", voice="5", staff="2", dot=True)
+                + note("C", 3, 6, "half", voice="5", staff="2", dot=True))
+    two_part = (
+        '<?xml version="1.0" encoding="UTF-8"?><score-partwise version="4.0"><part-list>'
+        '<score-part id="P1"><part-name>A</part-name></score-part>'
+        '<score-part id="P2"><part-name>B</part-name></score-part></part-list>'
+        '<part id="P1">'
+        + "".join(f'<measure number="{i}">{ATTR.format(beats=3) if i == 1 else ""}{FULL5}</measure>'
+                  for i in range(1, 5))
+        + '</part><part id="P2">'
+        + f'<measure number="1">{ATTR.format(beats=3)}{FULL5}</measure>'
+        + f'<measure number="2">{long_bar}</measure>'
+        + f'<measure number="4">{FULL5}</measure></part></score-partwise>')
+    root = root_of(two_part.encode())
+    assert lengths(root) != [3, 6, 3]  # misaligned: Verovio pairs bars by position
+    notes = sanitize(root)
+    counts = [len(p.findall("measure")) for p in root.findall("part")]
+    assert counts[0] == counts[1] == 3
+    assert any("disagreed about bar lines" in n for n in notes)
+    assert lengths(root) == [3, 6, 3]
+    r = render_musicxml(mx.to_bytes(root), "t")
+    assert abs(r.duration_s - 4 * 1.5) < 0.01
 
 
 def test_overfull_measure_is_reported_not_changed():
@@ -510,3 +554,120 @@ def test_pedal_keeps_the_last_chord_ringing():
     mf.save(file=buf)
     last_off, ring, n = _midi_extent(buf.getvalue())
     assert n == 1 and abs(last_off - 0.5) < 1e-6 and abs(ring - 2.5) < 1e-6
+
+
+# ---------------------------------------------------------------- choral parts
+
+
+def _satb_score(extra_part: str = "", extra_list: str = "") -> bytes:
+    """An original 3-bar SATB piece: S+A on one treble staff (two-note chords,
+    one unison), T+B on one bass staff, and a piano part on two staves."""
+    def v(step, octv, dur, typ, chord=False, staff="1", voice="1", lyric=None):
+        ly = f"<lyric><text>{lyric}</text></lyric>" if lyric else ""
+        return note(step, octv, dur, typ, voice=voice, staff=staff, chord=chord,
+                    dot=dur == 6).replace("</note>", ly + "</note>")
+    vocal_attr = lambda sign, line: (f'<attributes><divisions>2</divisions><key><fifths>0</fifths></key>'
+                                     f'<time><beats>3</beats><beat-type>4</beat-type></time>'
+                                     f'<clef><sign>{sign}</sign><line>{line}</line></clef></attributes>')
+    sa = [v("E", 5, 2, "quarter", lyric="la") + v("C", 5, 2, "quarter", chord=True)
+          + v("D", 5, 2, "quarter") + v("B", 4, 2, "quarter", chord=True)
+          + v("C", 5, 2, "quarter"),  # unison C5
+          v("G", 5, 6, "half") + v("E", 5, 6, "half", chord=True),
+          v("F", 5, 6, "half") + v("D", 5, 6, "half", chord=True)]
+    tb = [v("G", 3, 2, "quarter", lyric="la") + v("C", 3, 2, "quarter", chord=True)
+          + v("G", 3, 2, "quarter") + v("G", 2, 2, "quarter", chord=True)
+          + v("E", 3, 2, "quarter"),  # unison E3
+          v("C", 4, 6, "half") + v("C", 3, 6, "half", chord=True),
+          v("B", 3, 6, "half") + v("G", 2, 6, "half", chord=True)]
+    piano = [note("C", 5, 6, "half", dot=True) + backup(6) + note("C", 3, 6, "half", voice="5", staff="2", dot=True)] * 3
+    def part(pid, bars, attr):
+        return (f'<part id="{pid}">' + "".join(
+            f'<measure number="{i}">{attr if i == 1 else ""}{b}</measure>' for i, b in enumerate(bars, 1))
+            + "</part>")
+    piano_attr = ATTR.format(beats=3)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?><score-partwise version="4.0"><part-list>'
+        '<score-part id="P1"><part-name>Voice</part-name></score-part>'
+        '<score-part id="P2"><part-name>Voice</part-name></score-part>'
+        f'{extra_list}<score-part id="P3"><part-name>Piano</part-name></score-part></part-list>'
+        + part("P1", sa, vocal_attr("G", 2)) + part("P2", tb, vocal_attr("F", 4)) + extra_part
+        + part("P3", piano, piano_attr) + "</score-partwise>").encode()
+
+
+def _pitches(midi: bytes) -> list[int]:
+    return [m.note for m in mido.MidiFile(file=io.BytesIO(midi)) if m.type == "note_on" and m.velocity]
+
+
+def test_satb_on_two_staves_is_split_into_four_voices_and_piano():
+    r = render_musicxml(_satb_score(), "t", parts_names=None)
+    names = [(t.name, t.kind) for t in r.tracks]
+    assert names == [("Soprano", "voice"), ("Alto", "voice"), ("Tenor", "voice"),
+                     ("Bass", "voice"), ("Piano", "accompaniment")]
+    by = {t.name: t for t in r.tracks}
+    assert _pitches(by["Soprano"].midi) == [76, 74, 72, 79, 77]
+    assert _pitches(by["Alto"].midi) == [72, 71, 72, 76, 74]  # the unison C5 is sung by both
+    assert _pitches(by["Tenor"].midi) == [55, 55, 52, 60, 59]
+    assert _pitches(by["Bass"].midi) == [48, 43, 52, 48, 43]
+    # every part keeps the whole score's time line
+    ends = {t.name: _midi_extent_s(t.midi) for t in r.tracks}
+    assert max(ends.values()) - min(ends.values()) < 0.01
+    assert b"Soprano/Alto" in r.xml and b"Tenor/Bass" in r.xml  # staves renamed
+
+
+def _midi_extent_s(midi: bytes) -> float:
+    t = last = 0.0
+    for m in mido.MidiFile(file=io.BytesIO(midi)):
+        t += m.time
+        if m.type in ("note_on", "note_off"):
+            last = t
+    return last
+
+
+def test_part_names_can_be_given():
+    r = render_musicxml(_satb_score(), "t", parts_names=["Women", "Men", "Organ"])
+    assert [t.name for t in r.tracks] == ["Soprano", "Alto", "Tenor", "Bass", "Organ"]
+    r = render_musicxml(_satb_score(), "t", parts_names=["Upper/Lower", "", ""])
+    assert [t.name for t in r.tracks][:2] == ["Upper", "Lower"]
+
+
+def test_mix_tracks_puts_each_part_on_its_own_channel():
+    from sheet2audio.render import mix_tracks, track_notes
+    r = render_musicxml(_satb_score(), "t", parts_names=None)
+    out = mido.MidiFile(file=io.BytesIO(mix_tracks([(r, 0.0)], {"Piano": 0}, {"Alto": 0.0})))
+    chans = {m.channel for m in out if m.type == "note_on"}
+    assert len(chans) == 4 and 9 not in chans  # Alto left out; drum channel never used
+    notes = track_notes([(r, 1.0)])
+    assert notes["Soprano"][0][0] == 1000.0 and notes["Soprano"][0][2] == 76
+
+
+def test_piano_piece_gets_right_and_left_hand_parts():
+    r = render_musicxml(score([FULL5, FULL5]), "t", parts_names=None)
+    assert [t.name for t in r.tracks] == ["Right hand", "Left hand"]
+
+
+def test_music_read_into_the_wrong_voice_part_is_moved_back():
+    # Three one-staff voice parts; on the last line only the top voice sings,
+    # but OMR put its notes into the bass-clef part (with a treble clef).
+    def vpart(pid, sign, line, bars):
+        attr = (f'<attributes><divisions>2</divisions><time><beats>3</beats><beat-type>4</beat-type></time>'
+                f'<clef><sign>{sign}</sign><line>{line}</line></clef></attributes>')
+        return f'<part id="{pid}">' + "".join(
+            f'<measure number="{i}">{attr if i == 1 else ""}{b}</measure>' for i, b in enumerate(bars, 1)) + "</part>"
+    mel = note("E", 5, 6, "half", dot=True)
+    low = note("C", 3, 6, "half", dot=True)
+    rest = '<note><rest/><duration>6</duration><voice>1</voice><type>half</type><dot/><staff>1</staff></note>'
+    newline = '<print new-system="yes"/>'
+    moved = '<attributes><clef><sign>G</sign><line>2</line></clef></attributes>' + mel
+    xml = ('<?xml version="1.0" encoding="UTF-8"?><score-partwise version="4.0"><part-list>'
+           + "".join(f'<score-part id="P{k}"><part-name>Voice</part-name></score-part>' for k in (1, 2, 3))
+           + '</part-list>'
+           + vpart("P1", "G", 2, [mel, mel, rest, rest])
+           + vpart("P2", "G", 2, [mel, mel, rest, rest])
+           + vpart("P3", "F", 4, [low, low, moved, mel]) + '</score-partwise>')
+    xml = xml.replace('<measure number="3">', f'<measure number="3">{newline}')
+    root = root_of(xml.encode())
+    notes = sanitize(root)
+    assert any("moved back" in n for n in notes)
+    p1, p3 = root.findall("part")[0], root.findall("part")[2]
+    assert p1.findall("measure")[2].find("note/pitch") is not None
+    assert p3.findall("measure")[2].find("note/rest") is not None

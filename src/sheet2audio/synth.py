@@ -111,3 +111,89 @@ def encode(ffmpeg: Path, raw_wav: Path, outputs: dict[str, Path],
 def partial_name(dest: Path) -> Path:
     """A hidden sibling with the same extension (FFmpeg picks the format from it)."""
     return dest.with_name(f".{dest.stem}.partial{dest.suffix}")
+
+
+# ---------------------------------------------------------------- sample sheet
+
+# Programs whose notes sustain (organ, strings, choir, winds, pads): their
+# samples get a steady middle section the player can loop for long notes.
+SUSTAINED = set(range(16, 24)) | set(range(40, 56)) | set(range(56, 80)) | set(range(80, 96))
+_PRE_S = 0.05
+
+
+def sample_sheet_midi(needs: dict[int, set[int]]) -> tuple[bytes, dict[str, dict[str, list]]]:
+    """A MIDI file that plays every needed (program, pitch) once, one after the
+    other, and where each sample sits in the rendered audio:
+    {program: {pitch: [start s, length s, loop start s, loop end s]}} (loop
+    points only for sustaining programs)."""
+    import mido
+
+    tpb, ticks_per_s = 960, 1920
+    events = []
+    layout: dict[str, dict[str, list]] = {}
+    channels = [c for c in range(16) if c != 9]
+    t = 0.0
+    for k, (prog, pitches) in enumerate(sorted(needs.items())):
+        ch = channels[k % len(channels)]
+        events.append((0, 0, mido.Message("program_change", channel=ch, program=prog)))
+        sustained = prog in SUSTAINED
+        hold, window = (6.0, 6.6) if sustained else (3.6, 4.4)
+        for pitch in sorted(pitches):
+            on = t + _PRE_S
+            events.append((int(on * ticks_per_s), 2, mido.Message("note_on", channel=ch,
+                                                                   note=pitch, velocity=90)))
+            events.append((int((on + hold) * ticks_per_s), 1,
+                           mido.Message("note_off", channel=ch, note=pitch)))
+            entry = [round(on, 4), round(window - _PRE_S - 0.05, 4)]
+            if sustained:
+                entry += [round(on + 1.5, 4), round(on + 5.5, 4)]
+            layout.setdefault(str(prog), {})[str(pitch)] = entry
+            t += window
+    events.sort(key=lambda e: (e[0], e[1]))
+    mf = mido.MidiFile(type=0, ticks_per_beat=tpb)
+    tr = mido.MidiTrack()
+    mf.tracks.append(tr)
+    tr.append(mido.MetaMessage("set_tempo", tempo=500000))
+    now = 0
+    for tick, _, msg in events:
+        tr.append(msg.copy(time=tick - now))
+        now = tick
+    tr.append(mido.MetaMessage("end_of_track", time=ticks_per_s))
+    import io
+
+    buf = io.BytesIO()
+    mf.save(file=buf)
+    return buf.getvalue(), layout
+
+
+def render_sample_sheet(fluidsynth: Path, ffmpeg: Path, soundfont: Path,
+                        needs: dict[int, set[int]], dest: Path, tmp: Path) -> dict:
+    """Render the sample sheet to a mono MP3 (`dest`); returns its layout."""
+    midi, layout = sample_sheet_midi(needs)
+    mid = tmp / "samples.mid"
+    wav = tmp / "samples.wav"
+    mid.write_bytes(midi)
+    render_wav(fluidsynth, soundfont, mid, wav)
+    peak = peak_db(ffmpeg, wav)
+    gain = 0.0 if peak is None else PEAK_TARGET_DB - peak
+    part = partial_name(dest)
+    try:
+        proc = subprocess.run(
+            [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y", "-i", str(wav),
+             "-af", f"volume={gain:.2f}dB", "-ac", "1", "-ar", "32000",
+             "-c:a", "libmp3lame", "-b:a", "96k", str(part)],
+            capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise SynthError(f"FFmpeg could not write the sample sheet:\n{proc.stderr}")
+        os.replace(part, dest)
+    finally:
+        part.unlink(missing_ok=True)
+    return layout
+
+
+def silent_mp3(ffmpeg: Path, dest: Path) -> None:
+    """Half a second of silence. Playing it (looped) lets iPhones play the
+    page's Web Audio even when the ring/silent switch is on silent."""
+    subprocess.run([str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                    "-i", "anullsrc=r=22050:cl=mono", "-t", "0.5", "-c:a", "libmp3lame",
+                    "-b:a", "32k", str(dest)], capture_output=True, check=True)

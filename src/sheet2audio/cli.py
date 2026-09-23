@@ -29,9 +29,10 @@ import urllib.parse
 from pathlib import Path
 
 from . import musicxml, omr, synth, tools
-from .render import MovementJob, RenderError, combine_midi, process_movements
+from .render import (MovementJob, RenderError, combine_midi, mix_tracks, process_movements,
+                     track_names, track_notes)
 from .video import VideoError, VideoMovement, render_video
-from .viewer import write_viewer
+from .viewer import Player, write_viewer
 
 MOVEMENT_GAP_S = 2.0
 TAIL_S = 2.0  # audio kept after the last note ends
@@ -83,6 +84,15 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--time", type=_time_sig, metavar="N/D",
                    help="time signature to use if OMR read none, e.g. 3/4")
     p.add_argument("--soundfont", help="SoundFont (.sf2/.sf3) to play the music with")
+    p.add_argument("--parts", metavar="NAMES",
+                   help="name the parts, one per staff group in score order, e.g. "
+                        "\"Children, Soprano/Alto, Tenor/Bass, Piano\" ('/' splits a staff "
+                        "shared by two voices; leave an entry empty to keep the guess)")
+    p.add_argument("--voice-sound", choices=["choir", "piano"], default="choir",
+                   help="sound for sung parts in the audio and video (default: choir); the "
+                        "play-along page can switch")
+    p.add_argument("--no-rehearsal", action="store_true",
+                   help="for choral scores, skip the per-part rehearsal MP3s")
     p.add_argument("--formats", default="mp3,wav",
                    help=f"audio formats, comma-separated from {','.join(synth.FORMATS)} "
                         "(default: mp3,wav)")
@@ -95,7 +105,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
                    help="'encoded' keeps the line breaks of the original page (default); "
                         "'auto' lets Verovio re-flow the music")
     p.add_argument("--link-audio", action="store_true",
-                   help="make the HTML page load the MP3 next to it instead of embedding it")
+                   help="make the HTML page load its sounds from a file next to it instead of "
+                        "embedding them")
     p.add_argument("--sheets", help="only these pages, e.g. '1 3-4' (PDF/image input)")
     p.add_argument("--audiveris", help="path to the Audiveris executable or Audiveris.app")
     p.add_argument("--open", action="store_true", help="open the play-along page when done")
@@ -119,6 +130,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             a.sheets = omr.parse_sheets(a.sheets)
         except ValueError as e:
             p.error(f"--sheets: {e}")
+    a.parts = [x.strip() for x in a.parts.split(",")] if a.parts else None
     if a.serve is not None and not 1 <= a.serve <= 65535:
         p.error("--serve: port must be between 1 and 65535")
     return a
@@ -188,12 +200,13 @@ def _clean_stale(outdir: Path, keep: Path, will_omr: bool, notes: list[str]) -> 
     nor an Audiveris book that was changed after it was written."""
     prev = _read_report(outdir)
     doomed: list[Path] = [outdir / "report.json"]
-    for key in ("midi", "viewer", "video", "audiveris_log"):
+    for key in ("midi", "viewer", "video", "audiveris_log", "samples"):
         if isinstance(prev.get(key), str):
             doomed.append(Path(prev[key]))
-    audio = prev.get("audio")
-    if isinstance(audio, dict):
-        doomed += [Path(v) for v in audio.values() if isinstance(v, str)]
+    for key in ("audio", "rehearsal"):
+        files_ = prev.get(key)
+        if isinstance(files_, dict):
+            doomed += [Path(v) for v in files_.values() if isinstance(v, str)]
     if isinstance(prev.get("musicxml"), list):
         doomed += [Path(v) for v in prev["musicxml"] if isinstance(v, str)]
     if will_omr:  # run_audiveris writes these afresh
@@ -245,7 +258,7 @@ def run(argv: list[str] | None = None) -> dict:
     fluidsynth = tools.find_fluidsynth()
     ffmpeg = tools.find_ffmpeg()
     soundfont = tools.find_soundfont(a.soundfont)
-    codecs = synth.plan_codecs(ffmpeg, a.formats + (["mp3"] if not a.no_viewer else []))
+    codecs = synth.plan_codecs(ffmpeg, a.formats + ["mp3"])  # mp3 also for samples, rehearsal
     audiveris = tools.find_audiveris(a.audiveris) if suffix not in omr.MUSICXML_SUFFIXES else None
     notes: list[str] = []
     rsvg = None if a.no_video else tools.find_rsvg()
@@ -326,7 +339,8 @@ def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codec
     # 3. Repair and engrave each movement (in child processes)
     log.step(f"Engraving {len(roots)} movement(s) with Verovio")
     jobs = [MovementJob(xml=musicxml.to_bytes(r), title=t, repair=not a.no_repair, bpm=a.bpm,
-                        tempo_scale=a.tempo_scale, layout=a.layout, video=rsvg is not None)
+                        tempo_scale=a.tempo_scale, layout=a.layout, video=rsvg is not None,
+                        parts=a.parts or [])
             for r, t in zip(roots, titles)]
     results = process_movements(jobs)
     rendered = [r.rendered for r in results]
@@ -369,45 +383,87 @@ def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codec
         offsets.append(t)
         t += max(r.duration_s, r.ring_s) + MOVEMENT_GAP_S
     end_s = offsets[-1] + max(rendered[-1].duration_s, rendered[-1].ring_s) + TAIL_S
+    movs = list(zip(rendered, offsets))
+    kinds = {t.name: t.kind for r in rendered for t in r.tracks}
+    names = track_names(rendered)
+    voices = [n for n in names if kinds[n] == "voice"]
+    voice_program = 52 if a.voice_sound == "choir" else 0  # GM Choir Aahs / Acoustic Grand
+    programs = {t.name: (voice_program if t.kind == "voice" else t.program)
+                for r in rendered for t in r.tracks}
     midi_path = outdir / f"{stem}.mid"
-    midi_path.write_bytes(combine_midi([(r.midi, off, r.tempo_factor)
-                                        for r, off in zip(rendered, offsets)]))
+    if voices:
+        midi_path.write_bytes(mix_tracks(movs, programs, {}))
+    else:
+        midi_path.write_bytes(combine_midi([(r.midi, off, r.tempo_factor) for r, off in movs]))
     report["midi"] = str(midi_path)
+    report["parts"] = [{"name": n, "kind": kinds[n]} for n in names]
     report["movements"] = [
         {"title": r.title, "notes": r.note_count, "pages": len(r.svgs),
          "duration_s": round(r.duration_s, 3), "offset_s": round(off, 3),
-         "start_bpm": round(r.bpm, 3), "tempo_mark_read": r.has_tempo}
-        for r, off in zip(rendered, offsets)]
+         "start_bpm": round(r.bpm, 3), "tempo_mark_read": r.has_tempo,
+         "parts": [t.name for t in r.tracks]}
+        for r, off in movs]
+    if voices:
+        log.step("Parts: " + ", ".join(names))
 
     # 5. Audio, video, play-along page
     log.step(f"Synthesizing audio with FluidSynth ({soundfont.name})")
     with tempfile.TemporaryDirectory(prefix="sheet2audio-") as tmp:
-        raw = Path(tmp) / "raw.wav"
+        tmp = Path(tmp)
+        raw = tmp / "raw.wav"
         synth.render_wav(fluidsynth, soundfont, midi_path, raw)
         outputs = {fmt: outdir / f"{stem}.{fmt}" for fmt in a.formats}
         report["audio"] = {k: str(v) for k, v in outputs.items()}
-        viewer_audio = outputs.get("mp3")
-        if not a.no_viewer and viewer_audio is None:
-            viewer_audio = Path(tmp) / f"{stem}.mp3"
-        gain = synth.encode(ffmpeg, raw, {**outputs, **({"mp3": viewer_audio} if viewer_audio else {})},
-                            codecs, end_s)
+        gain = synth.encode(ffmpeg, raw, outputs, codecs, end_s)
+
+        downloads = []
+        if len(voices) >= 2 and not a.no_rehearsal:
+            log.step("Rehearsal tracks: " + ", ".join(voices))
+            report["rehearsal"] = {}
+            mixes = [(v, {n: (1.0 if n == v else 0.3 if kinds[n] == "voice" else 0.5)
+                          for n in names}) for v in voices]
+            if len(voices) < len(names):
+                mixes.append(("accompaniment", {n: (0.0 if kinds[n] == "voice" else 1.0)
+                                                for n in names}))
+            for label, gains in mixes:
+                mid = tmp / "rehearsal.mid"
+                wav = tmp / "rehearsal.wav"
+                mid.write_bytes(mix_tracks(movs, programs, gains))
+                synth.render_wav(fluidsynth, soundfont, mid, wav)
+                dest = outdir / f"{stem} - {label}.mp3"
+                synth.encode(ffmpeg, wav, {"mp3": dest}, codecs, end_s)
+                report["rehearsal"][label] = str(dest)
+                downloads.append((label, dest.name))
+
         if rsvg is not None:
             log.step("Drawing the score video")
             mp4 = outdir / f"{stem}.mp4"
             try:
-                render_video([VideoMovement(r.svgs_video, r.timemap, off)
-                              for r, off in zip(rendered, offsets)],
+                render_video([VideoMovement(r.svgs_video, r.timemap, off) for r, off in movs],
                              raw, synth.audio_filter(gain, end_s), mp4, ffmpeg, rsvg, end_s)
                 report["video"] = str(mp4)
             except VideoError as e:
                 notes.append(f"No MP4 video: {str(e).splitlines()[0]}")
+
         if not a.no_viewer:
+            log.step("Writing the play-along page")
+            needs: dict[int, set[int]] = {}
+            for n, ns in track_notes(movs).items():
+                progs = {52, 0} if kinds[n] == "voice" else {programs[n]}
+                for prog in progs:
+                    needs.setdefault(prog, set()).update(int(x[2]) for x in ns)
+            link = a.link_audio
+            sheet = (outdir if link else tmp) / f"{stem}.samples.mp3"
+            layout = synth.render_sample_sheet(fluidsynth, ffmpeg, soundfont, needs, sheet, tmp)
+            if link:
+                report["samples"] = str(sheet)
+            silent = tmp / "silent.mp3"
+            synth.silent_mp3(ffmpeg, silent)
             html_path = outdir / f"{stem}.html"
-            link = a.link_audio and "mp3" in outputs
-            if a.link_audio and not link:
-                notes.append("--link-audio needs mp3 in --formats; the audio was embedded instead.")
-            write_viewer(html_path, stem, list(zip(rendered, offsets)), viewer_audio, notes,
-                         embed_audio=not link)
+            player = Player(samples=sheet, layout=layout, silent=silent,
+                            voice_program=voice_program,
+                            programs={n: programs[n] for n in names}, downloads=downloads)
+            write_viewer(html_path, stem, movs, player, notes, end_s, embed_audio=not link)
             report["viewer"] = str(html_path)
 
     report["notes"] = notes

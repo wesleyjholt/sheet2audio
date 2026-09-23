@@ -39,6 +39,17 @@ class RenderError(RuntimeError):
 
 
 @dataclass
+class TrackAudio:
+    """One part (e.g. Alto, or Piano) of a rendered movement."""
+
+    name: str
+    kind: str  # "voice", "accompaniment" or "instrument"
+    program: int  # General MIDI program written in the score
+    ids: list[str]  # drawn notes (SVG data-id) it plays
+    midi: bytes  # this part alone, at the score tempo (apply tempo_factor)
+
+
+@dataclass
 class Rendered:
     title: str
     svgs: list[str]  # page layout (desktop)
@@ -53,6 +64,8 @@ class Rendered:
     ring_s: float  # when the last sound stops: later than duration_s if the pedal holds it
     note_count: int
     warnings: list[str] = field(default_factory=list)
+    tracks: list[TrackAudio] = field(default_factory=list)
+    xml: bytes = b""  # the MusicXML as engraved (staves named after the parts found)
 
     @property
     def bpm(self) -> float:
@@ -200,7 +213,8 @@ def _midi_extent(data: bytes) -> tuple[float, float, int]:
 
 
 def render_musicxml(xml: bytes, title: str, bpm: float | None = None, tempo_scale: float = 1.0,
-                    layout: str = "encoded", video: bool = False) -> Rendered:
+                    layout: str = "encoded", video: bool = False,
+                    parts_names: list[str] | bool | None = False) -> Rendered:
     """Engrave and time `xml`. With `bpm`, the score's first tempo becomes
     `bpm` and later tempo changes keep their ratio; otherwise every tempo is
     multiplied by `tempo_scale`. The tempo is applied here, not by Verovio,
@@ -208,6 +222,11 @@ def render_musicxml(xml: bytes, title: str, bpm: float | None = None, tempo_scal
     text = xml.decode("utf-8")
     warnings: list[str] = []
     tk = _toolkit(_options(DESKTOP, layout), text)
+    if parts_names is not False:
+        relabeled = _label_parts(text, tk.getMEI(), parts_names or None)
+        if relabeled != text:
+            text = relabeled
+            tk = _toolkit(_options(DESKTOP, layout), text)
     if layout == "encoded" and tk.getPageCount() == 0:
         warnings.append("The page layout from the PDF could not be kept; the music was re-flowed.")
         tk = _toolkit(_options(DESKTOP, "auto"), text)
@@ -230,6 +249,9 @@ def render_musicxml(xml: bytes, title: str, bpm: float | None = None, tempo_scal
         video_tk = _toolkit(_options(VIDEO), text)
         svgs_video = [video_tk.renderToSVG(p) for p in range(1, video_tk.getPageCount() + 1)]
 
+    tracks = []
+    if parts_names is not False:
+        tracks = _tracks(tk.getMEI(), parts_names or None, warnings)
     duration, ring, notes = _midi_extent(midi)
     # The last note starts at the same moment in the MIDI and in the timemap,
     # unless something (e.g. an absurd tempo) broke the MIDI timing.
@@ -243,8 +265,61 @@ def render_musicxml(xml: bytes, title: str, bpm: float | None = None, tempo_scal
         title=title, svgs=svgs, svgs_narrow=svgs_narrow, svgs_video=svgs_video, midi=midi,
         timemap=timemap, base_tempo=base_tempo, tempo_factor=factor,
         has_tempo=musicxml.has_tempo_mark(xml), duration_s=duration / factor,
-        ring_s=ring / factor, note_count=notes, warnings=warnings,
+        ring_s=ring / factor, note_count=notes, warnings=warnings, tracks=tracks,
+        xml=text.encode("utf-8"),
     )
+
+
+def _label_parts(text: str, mei: str, names: list[str] | None) -> str:
+    """Name the staves after the parts found (e.g. 'Soprano/Alto' instead of
+    the 'Voice' OMR wrote), where the score's own names are generic."""
+    import xml.etree.ElementTree as ET
+
+    from . import parts
+
+    tracks = parts.find_tracks(mei, names)
+    root = ET.fromstring(text.encode("utf-8"))
+    score_parts = {sp.get("id"): sp for sp in root.iter("score-part")}
+    n = 0
+    changed = False
+    for part in root.findall("part"):
+        staves = part.findtext("measure/attributes/staves")
+        count = int(staves) if staves and staves.strip().isdigit() else 1
+        mine = [str(k) for k in range(n + 1, n + count + 1)]
+        n += count
+        sp = score_parts.get(part.get("id"))
+        if sp is None:
+            continue
+        current = (sp.findtext("part-name") or "").strip()
+        if current and not parts.is_generic_name(current):
+            continue
+        label = "/".join(dict.fromkeys(t.name for t in tracks if set(t.staves) <= set(mine)
+                                       and t.kind == "voice"))
+        if not label:
+            continue
+        for tag, value in (("part-name", label),
+                           ("part-abbreviation", "/".join(x[:1] for x in label.split("/")))):
+            el = sp.find(tag)
+            if el is None:
+                el = ET.SubElement(sp, tag)
+            el.text = value
+        changed = True
+    if not changed:
+        return text
+    return ET.tostring(root, encoding="unicode", xml_declaration=True)
+
+
+def _tracks(mei: str, names: list[str] | None, warnings: list[str]) -> list[TrackAudio]:
+    """Each part's own MIDI, rendered from the MEI with the other parts' notes
+    replaced by silence (so all parts share the score's time line)."""
+    from . import parts
+
+    out = []
+    for t in parts.find_tracks(mei, names):
+        tk = _toolkit(_options(DESKTOP, "auto"), parts.isolate(mei, t))
+        out.append(TrackAudio(t.name, t.kind, t.program, sorted(t.ids),
+                              base64.b64decode(tk.renderToMIDI())))
+    return out
 
 
 # ---------------------------------------------------------------- per movement
@@ -259,6 +334,7 @@ class MovementJob:
     tempo_scale: float
     layout: str
     video: bool
+    parts: list[str] | None = None  # part names given by the user, one per staff group
 
 
 @dataclass
@@ -273,8 +349,8 @@ def process_movement(job: MovementJob) -> MovementResult:
     report = musicxml.repair(root, _heard_from_root, apply=job.repair)
     xml = musicxml.to_bytes(root)
     r = render_musicxml(xml, job.title, bpm=job.bpm, tempo_scale=job.tempo_scale,
-                        layout=job.layout, video=job.video)
-    return MovementResult(xml=xml, rendered=r, notes=report.notes)
+                        layout=job.layout, video=job.video, parts_names=job.parts or None)
+    return MovementResult(xml=r.xml or xml, rendered=r, notes=report.notes)
 
 
 def _ignore_sigint() -> None:
@@ -308,40 +384,22 @@ def process_movements(jobs: list[MovementJob], workers: int = 4) -> list[Movemen
 # ---------------------------------------------------------------- MIDI
 
 
-def combine_midi(parts: list[tuple[bytes, float, float]], tail_s: float = 2.0) -> bytes:
-    """Concatenate MIDI files: (data, start offset in seconds, tempo factor).
+def _events(data: bytes, offset: float, factor: float):
+    """(absolute seconds, message) for every channel message of a MIDI file."""
+    t = 0.0
+    for msg in mido.MidiFile(file=io.BytesIO(data)):
+        t += msg.time
+        if not msg.is_meta and msg.type != "sysex":
+            yield offset + t / factor, msg
 
-    Every event is re-timed on a fixed 120 BPM grid (1 tick = 1/1920 s) after
-    dividing its time by the tempo factor, so the tempo maps of the sources
-    are baked in. Before each next movement the sustain pedal is lifted and
-    sounding notes are stopped. Where two voices play the same key at once,
-    the key is struck again and released only when the last of them ends
-    (a synthesizer releases every voice on a key at its first note-off).
-    An end-of-track `tail_s` after the last event lets notes finish ringing.
-    """
+
+def _write(events: list[tuple[int, int, int, mido.Message]], tail_s: float) -> bytes:
+    """Serialise (tick, order, seq, message) events on a fixed 120 BPM grid.
+
+    Where two voices play the same key at once, the key is struck again and
+    released only when the last of them ends (a synthesizer releases every
+    voice on a key at its first note-off)."""
     tpb = 960
-    ticks_per_s = tpb * 2  # 120 BPM
-    events: list[tuple[int, int, int, mido.Message]] = []
-    seq = 0
-    for k, (data, offset, factor) in enumerate(parts):
-        t = 0.0
-        channels = set()
-        for msg in mido.MidiFile(file=io.BytesIO(data)):
-            t += msg.time
-            if msg.is_meta or msg.type == "sysex":
-                continue
-            seq += 1
-            channels.add(getattr(msg, "channel", 0))
-            is_off = msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0)
-            tick = int(round((offset + t / factor) * ticks_per_s))
-            events.append((tick, 0 if is_off else 1, seq, msg))
-        if k + 1 < len(parts):
-            release = int(round((parts[k + 1][1] - 0.01) * ticks_per_s))
-            for ch in sorted(channels):
-                for ctl in (64, 123):  # pedal up, all notes off
-                    seq += 1
-                    events.append((release, 0, seq, mido.Message("control_change", channel=ch,
-                                                                 control=ctl, value=0)))
     events.sort(key=lambda e: e[:3])
     out = mido.MidiFile(type=0, ticks_per_beat=tpb)
     track = mido.MidiTrack()
@@ -367,9 +425,118 @@ def combine_midi(parts: list[tuple[bytes, float, float]], tail_s: float = 2.0) -
                 if held[key] > 0:
                     continue
         elif msg.type == "control_change" and msg.control == 123:
-            held = {k: 0 for k in held}
+            held = {k: (0 if k[0] == msg.channel else v) for k, v in held.items()}
         emit(tick, msg)
-    track.append(mido.MetaMessage("end_of_track", time=int(tail_s * ticks_per_s)))
+    track.append(mido.MetaMessage("end_of_track", time=int(tail_s * TICKS_PER_S)))
     buf = io.BytesIO()
     out.save(file=buf)
     return buf.getvalue()
+
+
+TICKS_PER_S = 1920  # 960 ticks per quarter at 120 BPM
+
+
+def _is_off(msg: mido.Message) -> bool:
+    return msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0)
+
+
+def combine_midi(parts: list[tuple[bytes, float, float]], tail_s: float = 2.0) -> bytes:
+    """Concatenate MIDI files: (data, start offset in seconds, tempo factor).
+
+    Every event is re-timed on a fixed 120 BPM grid after dividing its time by
+    the tempo factor, so the tempo maps of the sources are baked in. Before
+    each next movement the sustain pedal is lifted and sounding notes are
+    stopped. An end-of-track `tail_s` after the last event lets notes finish.
+    """
+    events: list[tuple[int, int, int, mido.Message]] = []
+    seq = 0
+    for k, (data, offset, factor) in enumerate(parts):
+        channels = set()
+        for t, msg in _events(data, offset, factor):
+            seq += 1
+            channels.add(getattr(msg, "channel", 0))
+            events.append((int(round(t * TICKS_PER_S)), 0 if _is_off(msg) else 1, seq, msg))
+        if k + 1 < len(parts):
+            release = int(round((parts[k + 1][1] - 0.01) * TICKS_PER_S))
+            for ch in sorted(channels):
+                for ctl in (64, 123):  # pedal up, all notes off
+                    seq += 1
+                    events.append((release, 0, seq, mido.Message("control_change", channel=ch,
+                                                                 control=ctl, value=0)))
+    return _write(events, tail_s)
+
+
+_CHANNELS = [c for c in range(16) if c != 9]  # channel 10 (index 9) is General MIDI drums
+
+
+def track_names(movements: list[Rendered]) -> list[str]:
+    """Every part name, in order of first appearance across movements."""
+    return list(dict.fromkeys(t.name for r in movements for t in r.tracks))
+
+
+def mix_tracks(movements: list[tuple[Rendered, float]], programs: dict[str, int],
+               gains: dict[str, float], tail_s: float = 2.0) -> bytes:
+    """One MIDI file with every part on its own channel, with the given General
+    MIDI program and volume (0-1, as amplitude; 0 leaves the part out)."""
+    names = [n for n in track_names([r for r, _ in movements]) if gains.get(n, 1.0) > 0]
+    channel = {n: _CHANNELS[i % len(_CHANNELS)] for i, n in enumerate(names)}
+    events: list[tuple[int, int, int, mido.Message]] = []
+    seq = 0
+    for n, ch in channel.items():
+        # MIDI volume is a power curve: amplitude g -> value 127 * sqrt(g).
+        vol = max(0, min(127, round(127 * gains.get(n, 1.0) ** 0.5)))
+        for msg in (mido.Message("program_change", channel=ch, program=programs.get(n, 0)),
+                    mido.Message("control_change", channel=ch, control=7, value=vol),
+                    mido.Message("control_change", channel=ch, control=10, value=64)):
+            seq += 1
+            events.append((0, -1, seq, msg))
+    for k, (r, offset) in enumerate(movements):
+        for tr in r.tracks:
+            if tr.name not in channel:
+                continue
+            ch = channel[tr.name]
+            for t, msg in _events(tr.midi, offset, r.tempo_factor):
+                if msg.type in ("note_on", "note_off") or (
+                        msg.type == "control_change" and msg.control in (64, 66, 67)):
+                    seq += 1
+                    events.append((int(round(t * TICKS_PER_S)), 0 if _is_off(msg) else 1, seq,
+                                   msg.copy(channel=ch)))
+        if k + 1 < len(movements):
+            release = int(round((movements[k + 1][1] - 0.01) * TICKS_PER_S))
+            for ch in channel.values():
+                for ctl in (64, 123):
+                    seq += 1
+                    events.append((release, 0, seq, mido.Message("control_change", channel=ch,
+                                                                 control=ctl, value=0)))
+    return _write(events, tail_s)
+
+
+def track_notes(movements: list[tuple[Rendered, float]]) -> dict[str, list[list[float]]]:
+    """Per part, its notes as [start ms, release ms, MIDI pitch, velocity] on
+    the final time line. A note held by the sustain pedal is released when the
+    pedal is lifted (at most PEDAL_RING_MAX_S later)."""
+    out: dict[str, list[list[float]]] = {}
+    for r, offset in movements:
+        for tr in r.tracks:
+            notes = out.setdefault(tr.name, [])
+            sounding: dict[int, list[tuple[float, int]]] = {}
+            pedal_down = False
+            held: list[list[float]] = []
+            for t, msg in _events(tr.midi, offset, r.tempo_factor):
+                if msg.type == "note_on" and msg.velocity > 0:
+                    sounding.setdefault(msg.note, []).append((t, msg.velocity))
+                elif _is_off(msg) and sounding.get(msg.note):
+                    start, vel = sounding[msg.note].pop(0)
+                    n = [round(start * 1000, 1), round(t * 1000, 1), msg.note, vel]
+                    notes.append(n)
+                    if pedal_down:
+                        held.append(n)
+                elif msg.type == "control_change" and msg.control == 64:
+                    down = msg.value >= 64
+                    if pedal_down and not down:
+                        for n in held:
+                            n[1] = round(min(t * 1000, n[1] + PEDAL_RING_MAX_S * 1000), 1)
+                        held = []
+                    pedal_down = down
+            notes.sort()
+    return out

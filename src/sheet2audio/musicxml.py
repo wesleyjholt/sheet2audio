@@ -15,9 +15,11 @@ not make the bar exactly right is undone.
 from __future__ import annotations
 
 import copy
+import math
 import re
 import xml.etree.ElementTree as ET
 import zipfile
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -196,10 +198,249 @@ def sanitize(root: ET.Element, source_name: str | None = None) -> list[Note]:
     _order_ties(root)
     _normalize_repeat_barlines(root)
     notes += _drop_empty_measures(root)  # before the repeat fix: it moves barlines
+    notes += _align_part_barlines(root)
+    notes += _fix_part_mapping(root)
     notes += _implied_forward_repeats(root)
     notes += _tempo_from_words(root)
     notes += _jumps(root)
     notes += _check_keys(root)
+    return notes
+
+
+MERGED = "s2a-merged"  # marks measures joined by _align_part_barlines (removed by repair)
+
+
+def _measure_length(m: ET.Element, div: int) -> Fraction:
+    return Fraction(max(_Timing(m).staff_end.values(), default=0), div)
+
+
+def _align_part_barlines(root: ET.Element) -> list[Note]:
+    """OMR sometimes finds a barline on some staves but not on others, so the
+    parts disagree about where bars begin. Verovio pairs bars by position, and
+    the parts then drift apart. Join bars so that every part has the same bar
+    lines (those all parts agree on); the music itself is unchanged."""
+    parts = _parts(root)
+    if len(parts) < 2:
+        return []
+    per_part = []
+    for p in parts:
+        ms = p.findall("measure")
+        ctx = _part_context(p)
+        starts, t = [], Fraction(0)
+        for m, (div, _bar) in zip(ms, ctx):
+            starts.append(t)
+            length = _measure_length(m, div)
+            if length == 0:
+                return []  # an empty bar in one part only: too ambiguous to re-bar
+            t += length
+        per_part.append((ms, ctx, starts))
+    common = set.intersection(*(set(s) for _, _, s in per_part))
+    if all(set(s) == common for _, _, s in per_part):
+        return []
+    plans = []  # per part: list of groups (lists of measure indices)
+    for ms, ctx, starts in per_part:
+        groups: list[list[int]] = []
+        for i, s in enumerate(starts):
+            if s in common or not groups:
+                groups.append([i])
+            else:
+                groups[-1].append(i)
+        plans.append(groups)
+    if len({len(g) for g in plans}) != 1:
+        return []
+    # Every group that must be joined, in every part, has to be joinable.
+    for (ms, ctx, _), groups in zip(per_part, plans):
+        for g in groups:
+            if len(g) > 1 and not _joinable([ms[i] for i in g], [ctx[i][0] for i in g]):
+                return []
+    for (ms, ctx, _), groups in zip(per_part, plans):
+        for g in groups:
+            if len(g) > 1:
+                divs = [ctx[i][0] for i in g]
+                unit = math.lcm(*divs)  # one division size for the whole joined bar
+                lengths = [_measure_length(ms[i], ctx[i][0]) * unit for i in g]
+                for i in g:
+                    _scale_durations(ms[i], unit // ctx[i][0])
+                    for a in ms[i].findall("attributes"):
+                        for d in a.findall("divisions"):
+                            a.remove(d)
+                first = ms[g[0]]
+                attrs = first.find("attributes")
+                if attrs is None:
+                    attrs = ET.Element("attributes")
+                    _insert_after_header(first, attrs)
+                d = ET.Element("divisions")
+                d.text = str(unit)
+                attrs.insert(sum(1 for c in attrs if c.tag in ("footnote", "level")), d)
+                _join(first, [ms[i] for i in g[1:]], lengths, unit)
+                first.set(MERGED, "1")
+                nxt = g[-1] + 1
+                if nxt < len(ms) and unit != divs[-1] and not any(
+                        a.find("divisions") is not None for a in ms[nxt].findall("attributes")):
+                    # the bars after it still count in the old division size
+                    na = ms[nxt].find("attributes")
+                    if na is None:
+                        na = ET.Element("attributes")
+                        _insert_after_header(ms[nxt], na)
+                    dd = ET.Element("divisions")
+                    dd.text = str(divs[-1])
+                    na.insert(sum(1 for c in na if c.tag in ("footnote", "level")), dd)
+    first_ms = per_part[0][0]
+    spans = [g for groups in plans for g in groups if len(g) > 1]
+    lo, hi = min(g[0] for g in spans), max(g[-1] for g in spans)
+    last_label = _num(first_ms[hi], hi) if hi < len(first_ms) else str(hi + 1)
+    for (ms, _, _), groups, p in zip(per_part, plans, parts):
+        for i in sorted((i for g in groups for i in g[1:]), reverse=True):
+            p.remove(ms[i])
+    first_nums = [m.get("number") for m in parts[0].findall("measure")]
+    for p in parts[1:]:  # every part gets the first part's bar numbers
+        for m, n in zip(p.findall("measure"), first_nums):
+            if n is not None:
+                m.set("number", n)
+    return [Note(f"The parts disagreed about bar lines between measures {{m}} and {last_label} "
+                 "(OMR); those bars were joined so all parts stay together.", _ref(first_ms[lo]))]
+
+
+def _joinable(measures: list[ET.Element], divisions: list[int]) -> bool:
+    for k, m in enumerate(measures):
+        for b in m.findall("barline"):
+            loc = b.get("location") or "right"
+            interior = (loc == "right" and k < len(measures) - 1) or (loc == "left" and k > 0)
+            if interior and (b.find("repeat") is not None or b.find("ending") is not None):
+                return False
+    return True
+
+
+def _scale_durations(m: ET.Element, factor: int) -> None:
+    """Multiply every duration and offset in a measure (divisions changed)."""
+    if factor == 1:
+        return
+    for el in m.iter():
+        if el.tag in ("duration", "offset") and el.text and el.text.strip().lstrip("-").isdigit():
+            el.text = str(int(el.text) * factor)
+
+
+def _join(first: ET.Element, others: list[ET.Element], lengths_div: list[Fraction],
+          div: int) -> None:
+    """Append `others` to `first`, each starting where the previous one ended."""
+    for b in [b for b in first.findall("barline") if (b.get("location") or "right") == "right"]:
+        first.remove(b)
+    offset = int(lengths_div[0])
+    cursor = _Timing(first).pos
+    for k, m in enumerate(others):
+        # Back to the start of the bar, then forward to where the next bar
+        # begins. (Going there directly is the same in MusicXML, but Verovio
+        # then files the next notes on the staff it was last reading.)
+        for tag, dur in (("backup", cursor), ("forward", offset)):
+            if dur > 0:
+                el = ET.SubElement(first, tag)
+                ET.SubElement(el, "duration").text = str(dur)
+        last = k == len(others) - 1
+        for c in list(m):
+            loc = c.get("location") or "right"
+            if c.tag == "print" or (c.tag == "barline" and (loc == "left" or not last)):
+                continue
+            first.append(c)
+        cursor = offset + _Timing(m).pos
+        offset += int(lengths_div[k + 1])
+
+
+def _clef_sign(c: ET.Element) -> str:
+    oct_ = (c.findtext("clef-octave-change") or "0").strip()
+    return (c.findtext("sign") or "G").strip().upper() + ("8" if oct_ == "-1" else "")
+
+
+def _part_pitches(measures: list[ET.Element]) -> list[int]:
+    steps = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+    out = []
+    for m in measures:
+        for n in m.findall("note"):
+            p = n.find("pitch")
+            if p is None:
+                continue
+            try:
+                out.append(12 * (int(p.findtext("octave")) + 1) + steps.get(p.findtext("step"), 0)
+                           + round(float(p.findtext("alter") or 0)))
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _median(xs: list[int]) -> float:
+    s = sorted(xs)
+    return s[len(s) // 2] if s else 0.0
+
+
+def _fix_part_mapping(root: ET.Element) -> list[Note]:
+    """Choral scores hide the staves of resting voices, and OMR then has to
+    guess which part each staff of such a line belongs to. It sometimes puts
+    a staff into the wrong part, which then shows a clef change (e.g. the
+    children's line landing in the tenor/bass part with a treble clef).
+
+    For each line of music: if a one-staff part changes clef at the start of
+    the line, and another one-staff part that normally uses that clef rests
+    throughout the line, and the notes fit that part's range better, the
+    line's music is moved back to that part."""
+    parts = [p for p in _parts(root)
+             if all((n.findtext("staff") or "1") == "1" for n in p.iter("note"))]
+    if len(parts) < 2:
+        return []
+    all_parts = _parts(root)
+    n = min(len(p.findall("measure")) for p in all_parts)
+    starts = [i for i in range(n)
+              if any(_starts_system(p.findall("measure")[i]) for p in all_parts)] or [0]
+    if starts[0] != 0:
+        starts = [0] + starts
+    lines = list(zip(starts, starts[1:] + [n]))
+    usual = {}
+    for p in parts:
+        signs = Counter()
+        sign = "G"
+        for m in p.findall("measure")[:n]:
+            for c in m.iter("clef"):
+                sign = _clef_sign(c)
+            signs[sign] += 1
+        usual[id(p)] = signs.most_common(1)[0][0]
+    notes = []
+    for a, b in lines:
+        for p in parts:
+            ms = p.findall("measure")
+            first_clef = next(iter(ms[a].iter("clef")), None)
+            if first_clef is None or _clef_sign(first_clef) == usual[id(p)]:
+                continue
+            here = _part_pitches(ms[a:b])
+            if not here:
+                continue
+            new_sign = _clef_sign(first_clef)
+            for q in parts:
+                if q is p or usual[id(q)] != new_sign:
+                    continue
+                qms = q.findall("measure")
+                if _part_pitches(qms[a:b]):
+                    continue  # q sings on this line: not a free staff
+                elsewhere_p = _part_pitches(ms[:a] + ms[b:])
+                elsewhere_q = _part_pitches(qms[:a] + qms[b:])
+                if not elsewhere_q or abs(_median(here) - _median(elsewhere_q)) >= \
+                        abs(_median(here) - _median(elsewhere_p)):
+                    continue
+                for i in range(a, b):
+                    pm, qm = ms[i], qms[i]
+                    pc, qc = list(pm), list(qm)
+                    for c in pc:
+                        pm.remove(c)
+                    for c in qc:
+                        qm.remove(c)
+                    qm.extend(pc)
+                    pm.extend(qc)
+                # The clef change came with the music; p keeps its own clef.
+                for c in list(qms[a].iter("clef")):
+                    for attr in qms[a].findall("attributes"):
+                        if c in list(attr):
+                            attr.remove(c)
+                notes.append(Note("Measures {m}–" + _num(ms[b - 1], b - 1) + ": the music of one "
+                                  "voice had been read into another voice's part (a line with "
+                                  "fewer staves); it was moved back.", _ref(ms[a])))
+                break
     return notes
 
 
@@ -883,6 +1124,56 @@ def _fmt(q: Fraction) -> str:
     return f"{float(q):g}"
 
 
+def _beat_type(part: ET.Element, index: int) -> int:
+    bt = 4
+    for m in part.findall("measure")[: index + 1]:
+        for t in m.iter("time"):
+            try:
+                bt = int((t.findtext("beat-type") or "4").split("+")[0])
+            except ValueError:
+                pass
+    return bt
+
+
+def _meter_runs(lengths: list[Fraction], bars: list[Fraction | None],
+                skip: set[int]) -> list[tuple[int, int]]:
+    """Runs of 3+ consecutive bars that all play the same length, all
+    different from their (shared) time signature."""
+    runs, i, n = [], 0, len(lengths)
+    while i < n:
+        j = i
+        if bars[i] is not None and abs(lengths[i] - bars[i]) > TOL and lengths[i] > 0 \
+                and i not in skip:
+            while (j + 1 < n and j + 1 not in skip and bars[j + 1] == bars[i]
+                   and lengths[j + 1] == lengths[i]):
+                j += 1
+            if j - i >= 2:
+                runs.append((i, j))
+        i = j + 1
+    return runs
+
+
+def _set_time_at(parts: list[ET.Element], index: int, beats: int, beat_type: int) -> None:
+    for part in parts:
+        ms = part.findall("measure")
+        if index >= len(ms):
+            continue
+        m = ms[index]
+        attrs = m.find("attributes")
+        if attrs is None:
+            attrs = ET.Element("attributes")
+            _insert_after_header(m, attrs)
+        t = attrs.find("time")
+        if t is None:
+            t = ET.Element("time")
+            pos = sum(1 for c in attrs if c.tag in ("footnote", "level", "divisions", "key"))
+            attrs.insert(pos, t)
+        for c in list(t):
+            t.remove(c)
+        ET.SubElement(t, "beats").text = str(beats)
+        ET.SubElement(t, "beat-type").text = str(beat_type)
+
+
 def repair(root: ET.Element, heard: Callable[[ET.Element], list[Fraction]],
            apply: bool = True) -> RepairReport:
     """Check every bar's played length against its time signature; pad the
@@ -908,11 +1199,36 @@ def repair(root: ET.Element, heard: Callable[[ET.Element], list[Fraction]],
     if len(lengths) != n:
         return rep  # measures could not be matched up; do nothing rather than guess
 
+    def num(i):
+        return _num(measures0[i], i)
+
+    merged = {i for i, m in enumerate(measures0) if m.get(MERGED)}
+    for m in root.iter("measure"):
+        m.attrib.pop(MERGED, None)
+
+    # Runs of equally long bars that disagree with the time signature: a
+    # missed time signature (e.g. the return to 4/4 after one 2/4 bar).
+    for i, j in _meter_runs(lengths, bars, merged):
+        beat_type = _beat_type(parts[0], i)
+        beats = lengths[i] * beat_type / 4
+        label = f"{num(i)}–{num(j)}"
+        if apply and beats.denominator == 1 and 1 <= beats <= 32:
+            _set_time_at(parts, i, int(beats), beat_type)
+            back = bars[i] * beat_type / 4
+            if j + 1 < n and lengths[j + 1] == bars[i] and back.denominator == 1:
+                _set_time_at(parts, j + 1, int(back), beat_type)  # and back again
+            rep.notes.append(f"Measures {label} all play {_fmt(lengths[i])} beats but the time "
+                             f"signature said {_fmt(bars[i])}: a time signature was probably "
+                             f"missed; using {int(beats)}/{beat_type} from measure {num(i)}.")
+        else:
+            rep.notes.append(f"Measures {label} all play {_fmt(lengths[i])} beats but the time "
+                             f"signature says {_fmt(bars[i])}: the time signature may have been "
+                             "misread.")
+    bars = [b for _, b in _part_context(parts[0])]
+
     def short(i):
         return bars[i] is not None and lengths[i] < bars[i] - TOL
 
-    def num(i):
-        return _num(measures0[i], i)
 
     exempt: set[int] = set()
     kept: list[str] = []
@@ -955,22 +1271,8 @@ def repair(root: ET.Element, heard: Callable[[ET.Element], list[Fraction]],
                 kept.append(num(i))
         if _repeat(m, "right", "forward"):
             fwd = i + 1
-    # Runs of three or more equally short bars: probably a misread meter.
-    i = 0
-    while i < n:
-        j = i
-        while j + 1 < n and short(i) and short(j + 1) and lengths[j + 1] == lengths[i] \
-                and bars[j + 1] == bars[i]:
-            j += 1
-        if short(i) and j - i >= 2:
-            exempt.update(range(i, j + 1))
-            rep.notes.append(
-                f"Measures {num(i)}–{num(j)} all play {_fmt(lengths[i])} beats but the time "
-                f"signature says {_fmt(bars[i])}: the time signature may have been misread.")
-        i = j + 1
-
     for i in range(n):
-        if bars[i] is not None and lengths[i] > bars[i] + TOL:
+        if bars[i] is not None and lengths[i] > bars[i] + TOL and i not in merged:
             rep.overfull.append(num(i))
             rep.notes.append(f"Measure {num(i)} plays {_fmt(lengths[i])} beats in a "
                              f"{_fmt(bars[i])}-beat bar; check it.")
