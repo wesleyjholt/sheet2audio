@@ -70,18 +70,23 @@ def concat(lists: list[list[tuple[float, int]]]) -> list[tuple[float, int]]:
     return out
 
 
-def run_case(name: str, src: Path, gt: list[Path], extra: list[str], out: Path) -> dict:
+def run_case(name: str, src: Path, gt: list[Path], extra: list[str], out: Path,
+             rescore: bool = False) -> dict:
     dest = out / re.sub(r"[^\w.-]+", "_", name)
     t0 = time.monotonic()
-    proc = subprocess.run(
-        [sys.executable, "-m", "sheet2audio.cli", str(src), "-o", str(dest), "-q",
-         "--no-video", "--no-viewer", "--formats", "wav", *extra],
-        capture_output=True, text=True, cwd=ROOT,
-    )
-    res = {"name": name, "exit": proc.returncode, "secs": round(time.monotonic() - t0, 1)}
-    if proc.returncode != 0:
-        res["error"] = (proc.stderr.strip().splitlines() or ["?"])[0][:200]
-        return res
+    done = dest / "report.json"
+    if rescore and done.is_file() and json.loads(done.read_text()).get("status") == "done":
+        res = {"name": name, "exit": 0, "secs": 0.0, "rescored": True}
+    else:
+        proc = subprocess.run(
+            [sys.executable, "-m", "sheet2audio.cli", str(src), "-o", str(dest), "-q",
+             "--no-video", "--no-viewer", "--formats", "wav", *extra],
+            capture_output=True, text=True, cwd=ROOT,
+        )
+        res = {"name": name, "exit": proc.returncode, "secs": round(time.monotonic() - t0, 1)}
+        if proc.returncode != 0:
+            res["error"] = (proc.stderr.strip().splitlines() or ["?"])[0][:200]
+            return res
     report = json.loads((dest / "report.json").read_text())
     xmls = [Path(p) for p in report["musicxml"]]
     with VEROVIO:
@@ -101,12 +106,14 @@ def main() -> None:
     ap.add_argument("--jobs", type=int, default=4)
     ap.add_argument("--filter", default="")
     ap.add_argument("--out", type=Path, default=ROOT / "out" / "corpus")
+    ap.add_argument("--rescore", action="store_true",
+                    help="score existing outputs instead of re-running the pipeline")
     a = ap.parse_args()
     todo = [c for c in cases() if re.search(a.filter, c[0])]
     a.out.mkdir(parents=True, exist_ok=True)
     def safe(c):
         try:
-            return run_case(*c, a.out)
+            return run_case(*c, a.out, a.rescore)
         except Exception as e:  # noqa: BLE001 - one bad case must not stop the run
             return {"name": c[0], "exit": -1, "secs": 0, "error": f"scoring failed: {e!r}"[:200]}
 

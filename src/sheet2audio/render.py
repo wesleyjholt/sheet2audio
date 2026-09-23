@@ -17,6 +17,7 @@ from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from fractions import Fraction
+from pathlib import Path
 
 import mido
 import verovio
@@ -56,9 +57,15 @@ class Rendered:
         return self.base_tempo * self.tempo_factor
 
 
+_RESOURCES = str(Path(verovio.__file__).with_name("data"))
+
+
 def _toolkit(options: dict, text: str) -> verovio.toolkit:
     verovio.enableLog(verovio.LOG_OFF)
     tk = verovio.toolkit()
+    # Outside the main thread the binding's default resource path is a stale
+    # build-time path, and every load fails; set it explicitly.
+    tk.setResourcePath(_RESOURCES)
     tk.setOptions(options)
     if not tk.loadData(text):
         raise RenderError("Verovio could not read the MusicXML.")

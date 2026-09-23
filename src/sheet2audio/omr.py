@@ -148,8 +148,12 @@ def _stage_image(source: Path, dest_dir: Path, pages: list[int] | None) -> _Stag
             frame = frame.convert("RGBA")
             white = Image.new("RGBA", frame.size, (255, 255, 255, 255))
             frame = Image.alpha_composite(white, frame)
+        if frame.mode.startswith("I") or frame.mode == "F":  # 16/32-bit gray: scale, don't clip
+            frame = frame.convert("I") if frame.mode != "F" else frame
+            hi = frame.getextrema()[1] or 1
+            frame = frame.point(lambda v: v * (255.0 / hi) if hi > 255 else v).convert("L")
         if frame.mode not in ("1", "L"):
-            frame = frame.convert("L")  # also handles CMYK and 16-bit, which Audiveris rejects
+            frame = frame.convert("L")  # also handles CMYK, which Audiveris rejects
         w, h = frame.size
         if w * h > MAX_PIXELS * 0.97:
             k = math.sqrt(MAX_PIXELS * 0.95 / (w * h))
@@ -157,13 +161,35 @@ def _stage_image(source: Path, dest_dir: Path, pages: list[int] | None) -> _Stag
             notes.append(f"The image was {w * h / 1e6:.0f} megapixels; it was shrunk to "
                          f"{frame.size[0]}x{frame.size[1]} (Audiveris' limit is 20).")
         frames.append(frame)
-    if len(frames) == 1:
+    dpi = _image_dpi(img, frames[0])
+    if dpi < 130:
+        # Too coarse for Audiveris to find the staff lines. Wrapped in a PDF of
+        # the right page size, the image is drawn at 300 dpi, i.e. enlarged
+        # with smoothing, which Audiveris can read.
+        dest = dest_dir / "score.pdf"
+        frames[0].save(dest, save_all=True, append_images=frames[1:], resolution=float(dpi))
+        notes.append(f"The image is only about {dpi:.0f} dpi; it was enlarged for recognition, "
+                     "so expect mistakes (300 dpi scans work best).")
+    elif len(frames) == 1:
         dest = dest_dir / "score.png"
         frames[0].save(dest)
     else:
         dest = dest_dir / "score.tif"
         frames[0].save(dest, save_all=True, append_images=frames[1:], compression="tiff_lzw")
     return _Staged(dest, selected, notes=notes, is_image=True)
+
+
+def _image_dpi(img, frame) -> float:
+    """The image's resolution: its own tag if plausible, else assume the width
+    of a letter/A4 page (about 8.3-8.5 inches)."""
+    tag = img.info.get("dpi")
+    try:
+        d = float(tag[0]) if tag else 0.0
+    except (TypeError, ValueError, IndexError):
+        d = 0.0
+    if not 50 <= d <= 1200 or d == 72:  # 72 is usually a meaningless default
+        d = frame.size[0] / 8.5
+    return d
 
 
 def _stage(source: Path, tmp: Path, work: Path, pages: list[int] | None) -> _Staged:

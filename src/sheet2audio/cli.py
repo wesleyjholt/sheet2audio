@@ -263,7 +263,11 @@ def run(argv: list[str] | None = None) -> dict:
     xml_paths = []
     for i, (res_i, title) in enumerate(zip(results, titles), 1):
         prefix = f"{title}: " if multi else ""
-        notes += [prefix + n for n in res_i.notes + res_i.rendered.warnings]
+
+        def note(text: str) -> str:
+            return prefix + text if prefix else text[:1].upper() + text[1:]
+
+        notes += [note(n) for n in res_i.notes + res_i.rendered.warnings]
         name = f"{stem}.mvt{i}.musicxml" if multi else f"{stem}.musicxml"
         path = outdir / name
         if path.resolve() == src.resolve():
@@ -274,10 +278,10 @@ def run(argv: list[str] | None = None) -> dict:
         log.step(f"{title}: {r.note_count} notes, {len(r.svgs)} page(s), {r.duration_s:.1f} s "
                  f"at {r.bpm:g} BPM")
         if r.note_count == 0:
-            notes.append(f"{prefix}no notes were recognised.")
+            notes.append(note("no notes were recognised."))
         if not r.has_tempo and a.bpm is None:
-            notes.append(f"{prefix}no tempo mark was read, so it plays at {r.bpm:g} BPM; "
-                         "use --bpm to change it.")
+            notes.append(note(f"no tempo mark was read, so it plays at {r.bpm:g} BPM; "
+                              "use --bpm to change it."))
     total_notes = sum(r.note_count for r in rendered)
     if total_notes == 0:
         raise UsageError("no notes were recognised. If this is a scan, try a cleaner or "
