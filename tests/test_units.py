@@ -812,3 +812,27 @@ def test_mix_tracks_with_many_parts_never_mixes_sounds_on_a_channel():
     for m in out:
         if m.type == "program_change":
             assert chan_prog.setdefault(m.channel, m.program) == m.program
+
+
+def test_beams_repeated_on_chord_notes_do_not_lose_notes():
+    def bn(step, octv, chord, beam):
+        b = "".join(f'<beam number="1">{beam}</beam>' for _ in [0])
+        return note(step, octv, 1, "eighth", chord=chord).replace("<staff>", b + "<staff>")
+    bar = (bn("G", 4, False, "begin") + bn("D", 5, True, "begin")
+           + bn("A", 4, False, "end") + bn("C", 5, True, "end")) * 3
+    xml = _voices([("Soprano/Alto", "G", "2", [bar])])
+    root = root_of(xml)
+    sanitize(root)
+    r = render_musicxml(mx.to_bytes(root), "t")
+    assert r.note_count == 12
+
+
+def test_audiveris_lyric_numbers_follow_the_lines_on_the_page():
+    def ly(num, y):
+        return f'<lyric number="{num}" default-y="{y}"><syllabic>single</syllabic><text>la</text></lyric>'
+    bar = "".join(_q("C", 5).replace("</note>", ly(k, -89 - (k % 2)) + "</note>") for k in (1, 4, 7))
+    two = _q("C", 5).replace("</note>", ly(1, -89) + ly(2, -116) + "</note>") * 3
+    root = root_of(_voices([("Voice", "G", "2", [bar, two])]))
+    mx._renumber_lyrics(root)  # applied to Audiveris output only
+    nums = [l.get("number") for l in root.iter("lyric")]
+    assert nums == ["1", "1", "1", "1", "2", "1", "2", "1", "2"]

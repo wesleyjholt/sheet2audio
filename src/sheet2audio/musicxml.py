@@ -195,6 +195,9 @@ def sanitize(root: ET.Element, source_name: str | None = None) -> list[Note]:
     if audiveris:
         notes += _drop_octave_shifts(root)
     notes += _implausible_tempos(root)
+    _strip_chord_beams(root)
+    if audiveris:
+        _renumber_lyrics(root)
     _order_ties(root)
     _normalize_repeat_barlines(root)
     notes += _drop_empty_measures(root)  # before the repeat fix: it moves barlines
@@ -576,6 +579,47 @@ def _implausible_tempos(root: ET.Element) -> list[Note]:
                 if not ok:
                     del snd.attrib["tempo"]
     return notes
+
+
+def _strip_chord_beams(root: ET.Element) -> None:
+    """A chord's beam belongs to its first note. Audiveris repeats the <beam>
+    marks on the other notes of the chord, and Verovio's reader then drops
+    most of the beamed notes (28% of one real choral score went missing)."""
+    for note in root.iter("note"):
+        if note.find("chord") is not None:
+            for b in note.findall("beam"):
+                note.remove(b)
+
+
+_LYRIC_LINE_GAP = 12  # tenths of a staff space between lyric lines
+
+
+def _renumber_lyrics(root: ET.Element) -> None:
+    """Number lyric lines by their height on the page, line by line of music:
+    Audiveris sometimes gives each syllable of one line its own verse number,
+    and each number is then drawn on a line of its own."""
+    parts = _parts(root)
+    if not parts:
+        return
+    n = min(len(p.findall("measure")) for p in parts)
+    starts = [0] + [i for i in range(1, n) if any(_starts_system(p.findall("measure")[i])
+                                                  for p in parts)]
+    for part in parts:
+        ms = part.findall("measure")
+        for a, b in zip(starts, starts[1:] + [len(ms)]):
+            lyrics = [ly for m in ms[a:b] for ly in m.iter("lyric")]
+            try:
+                ys = sorted({float(ly.get("default-y")) for ly in lyrics}, reverse=True)
+            except (TypeError, ValueError):
+                continue  # some lyric without a position: leave this line alone
+            line, last, level = {}, None, 0
+            for y in ys:  # top line first
+                if last is not None and last - y > _LYRIC_LINE_GAP:
+                    level += 1
+                line[y] = level + 1
+                last = y
+            for ly in lyrics:
+                ly.set("number", str(line[float(ly.get("default-y"))]))
 
 
 def _order_ties(root: ET.Element) -> None:
