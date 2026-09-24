@@ -24,7 +24,7 @@ from pathlib import Path
 import mido
 import verovio
 
-from . import musicxml
+from . import ledger, musicxml
 
 DEFAULT_TEMPO = 120.0  # Verovio's tempo when the score has none
 
@@ -67,6 +67,7 @@ class Rendered:
     warnings: list[str] = field(default_factory=list)
     tracks: list[TrackAudio] = field(default_factory=list)
     xml: bytes = b""  # the MusicXML as engraved (staves named after the parts found)
+    count: ledger.RenderCount | None = None  # notes given, drawn and played
 
     @property
     def bpm(self) -> float:
@@ -255,6 +256,18 @@ def render_musicxml(xml: bytes, title: str, bpm: float | None = None, tempo_scal
         video_tk = _toolkit(_options(VIDEO), text)
         svgs_video = [video_tk.renderToSVG(p) for p in range(1, video_tk.getPageCount() + 1)]
 
+    count = ledger.render_count(text.encode("utf-8"), tk.getMEI(), raw_timemap)
+    if count.lost:
+        lost = sum(k for _, k in count.lost)
+        warnings.append(f"{lost} note{'s' if lost != 1 else ''} of the score could not be engraved "
+                        f"(measures {ledger.bars_text(count.lost)}), so they are neither shown nor "
+                        "played. This is a bug in sheet2audio; please report it with this score.")
+    if count.silent:
+        quiet = sum(k for _, k in count.silent)
+        warnings.append(f"{quiet} note{'s' if quiet != 1 else ''} are shown but never played "
+                        f"(measures {ledger.bars_text(count.silent)}); a misread 1st/2nd-ending "
+                        "bracket or repeat is the usual cause. Check these bars.")
+
     tracks = []
     if parts_names is not False:
         tracks = _tracks(tk.getMEI(), part_entries, hands, warnings)
@@ -272,7 +285,7 @@ def render_musicxml(xml: bytes, title: str, bpm: float | None = None, tempo_scal
         timemap=timemap, base_tempo=base_tempo, tempo_factor=factor,
         has_tempo=musicxml.has_tempo_mark(xml), duration_s=duration / factor,
         ring_s=ring / factor, note_count=notes, warnings=warnings, tracks=tracks,
-        xml=text.encode("utf-8"),
+        xml=text.encode("utf-8"), count=count,
     )
 
 

@@ -164,10 +164,20 @@ PDF/image ─▶ Pillow/pypdf ─▶ Audiveris ─▶ MusicXML ─▶ clean-up +
 
 Verovio makes the MIDI, the timemap (note id → start and stop time) and all three layouts (page, phone and video) from one document with the same note ids. The page highlighting and the video therefore stay in step with the audio.
 
+## No silent note loss
+
+Every run counts the notes at each stage: noteheads Audiveris recognised, notes in its MusicXML, notes after clean-up, notes drawn, and notes played. The counts are in `report.json` under `ledger`.
+
+- **Audiveris dropped notes it recognised.** Named bar by bar in the notes.
+- **A later stage lost notes.** This means a bug in this tool, and you are told so. The corpus run fails on any such loss.
+
+The ledger cannot see a notehead that Audiveris never recognised. For that, the tool checks for staves with nothing written in part of a bar. `tests/audit_materials.py` puts each printed line next to its rendering for a full check by eye.
+
 ## Tests
 
 ```bash
 uv run pytest -q                           # fast unit tests
-uv run python tests/corpus.py --jobs 4     # all 122 fixtures through the CLI, scored (about 10 min)
+uv run python tests/corpus.py --jobs 4     # all fixtures through the CLI, scored; exits 1 if the note ledger breaks
 uv run python tests/evaluate.py GROUND_TRUTH.midi OUTPUT.musicxml --bar 3
+uv run python tests/audit_materials.py OUTDIR PIECE.pdf DEST   # printed line vs our rendering, per line
 ```

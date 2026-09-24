@@ -988,3 +988,99 @@ def test_a_staff_with_a_hole_is_named_but_rests_and_second_voices_are_not():
     root = mx.parse(score([full, hole, voices, rest], beats=4))
     gaps = mx.staff_gaps(root)
     assert len(gaps) == 1 and gaps[0].startswith("Measure 2: Piano (left hand) has nothing at beat 1–2")
+
+
+# ---------------------------------------------------------------- note ledger
+
+
+def test_ledger_catches_notes_verovio_does_not_engrave():
+    # Chord members that repeat <beam> (Audiveris does this): Verovio drops them.
+    def bn(step, octv, chord, beam):
+        return note(step, octv, 1, "eighth", chord=chord).replace(
+            "<staff>", f'<beam number="1">{beam}</beam><staff>')
+    bar = (bn("G", 4, False, "begin") + bn("D", 5, True, "begin")
+           + bn("A", 4, False, "end") + bn("C", 5, True, "end")) * 3
+    xml = _voices([("Soprano/Alto", "G", "2", [bar])])
+    r = render_musicxml(xml, "t")  # not sanitized: the beams are still on the chord notes
+    assert r.count.cleaned == 12 and r.count.drawn < 12
+    assert r.count.lost and r.count.lost[0][0] == "1"
+    assert any("could not be engraved" in w for w in r.warnings)
+    root = root_of(xml)
+    sanitize(root)
+    fixed = render_musicxml(mx.to_bytes(root), "t")
+    assert (fixed.count.cleaned, fixed.count.drawn, fixed.count.played) == (12, 12, 12)
+    assert not fixed.count.lost and not fixed.count.silent
+
+
+def test_ledger_counts_tied_notes_as_heard_and_finds_notes_never_played():
+    from sheet2audio import ledger
+    tied = note("C", 5, 6, "whole").replace("<voice>", '<tie type="start"/><voice>')
+    held = note("C", 5, 6, "whole").replace("<voice>", '<tie type="stop"/><voice>')
+    r = render_musicxml(score([tied, held]), "t")
+    assert (r.count.cleaned, r.count.drawn, r.count.played) == (2, 2, 2) and not r.count.silent
+    # A drawn note the timemap never plays is reported by measure.
+    mei_tk = verovio.toolkit()
+    mei_tk.loadData(score([FULL, FULL]).decode())
+    count = ledger.render_count(score([FULL, FULL]), mei_tk.getMEI(), [])
+    assert count.played == 0 and [m for m, _ in count.silent] == ["1", "2"]
+
+
+def test_ledger_names_bars_where_audiveris_wrote_out_fewer_notes_than_it_recognised(tmp_path):
+    import zipfile
+
+    from sheet2audio import ledger
+    # A book page with two bars: 2 heads in bar 1 (one chord), 3 in bar 2 (two chords).
+    sheet = ('<sheet><page id="1"><system id="1">'
+             '<stack id="1" left="100" right="500"/><stack id="2" left="500" right="900"/>'
+             '<part id="1"><measure id="1"><head-chords>10</head-chords></measure>'
+             '<measure id="2"><head-chords>20 21</head-chords></measure></part>'
+             '<sig><inters>'
+             '<head staff="1" id="1"><bounds x="200" y="0" w="10" h="10"/></head>'
+             '<head staff="1" id="2"><bounds x="200" y="20" w="10" h="10"/></head>'
+             '<head staff="1" id="3"><bounds x="600" y="0" w="10" h="10"/></head>'
+             '<head staff="1" id="4"><bounds x="700" y="0" w="10" h="10"/></head>'
+             '<head staff="1" id="5"><bounds x="700" y="20" w="10" h="10"/></head>'
+             '</inters><relations>'
+             '<relation source="10" target="1"><containment/></relation>'
+             '<relation source="10" target="2"><containment/></relation>'
+             '<relation source="20" target="3"><containment/></relation>'
+             '<relation source="21" target="4"><containment/></relation>'
+             '<relation source="21" target="5"><containment/></relation>'
+             '</relations></sig></system></page></sheet>')
+    book = tmp_path / "b.omr"
+    with zipfile.ZipFile(book, "w") as z:
+        z.writestr("sheet#1/sheet#1.xml", sheet)
+    heads = ledger.book_heads(book)
+    assert heads == {(0, 0): 2, (0, 1): 3}
+    # Audiveris' MusicXML: bar 1 complete, bar 2 lost its two-note chord.
+    root = root_of(score([note("C", 5, 2, "quarter") + note("E", 5, 2, "quarter", chord=True)
+                          + note("C", 5, 4, "half"),
+                          note("D", 5, 6, "half", dot=True)]))
+    mx.tag_measures(root)
+    notes = ledger.book_loss_notes([root], heads, skip=set())
+    assert len(notes[0]) == 1 and "2 more notes" in notes[0][0].text
+    assert mx.resolve_notes(notes[0], [root], ["t"])[0].startswith("Measure 2:")
+    # A bar already explained elsewhere (chords Audiveris could not time) is not repeated.
+    assert ledger.book_loss_notes([root], heads, skip={(0, 1)}) == [[]]
+
+
+def test_ending_brackets_without_a_repeat_are_dropped_and_real_ones_kept():
+    def bl(loc, *inner):
+        return f'<barline location="{loc}">{"".join(inner)}</barline>'
+    start1 = '<ending number="1" type="start"/>'
+    stop1 = '<ending number="1" type="stop"/>'
+    start2 = '<ending number="2" type="start"/>'
+    back = '<repeat direction="backward"/>'
+    q = note("C", 5, 6, "half", dot=True)
+    # Bars 2-3: a misread bracket with no repeat. Bars 5-6: a real 1st/2nd ending.
+    bars = [q, bl("left", start1) + q, q + bl("right", stop1), q,
+            bl("left", start1) + q + bl("right", stop1, back), bl("left", start2) + q, q]
+    root = root_of(score(bars))
+    notes = sanitize(root)
+    ends = [(m.get("number"), e.get("number"), e.get("type"))
+            for m in root.iter("measure") for e in m.iter("ending")]
+    assert ends == [("5", "1", "start"), ("5", "1", "stop"), ("6", "2", "start")]
+    assert any("removed a 1st/2nd-ending bracket" in n for n in notes)
+    # Every bar is played: 1 2 3 4 5 | 1 2 3 4 6 7 after the repeat back to the start.
+    r = render_musicxml(mx.to_bytes(root), "t")
+    assert not r.count.silent

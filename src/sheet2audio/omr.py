@@ -514,11 +514,24 @@ def log_warnings(log: Path, limit: int = 20) -> list[str]:
 # ---------------------------------------------------------------- keys from the book
 
 
+def page_bar_order(page) -> dict[str, int]:
+    """Audiveris' bar ids on one page (its stack ids: 1, 2, ... or 0, 1, ...
+    when the page starts with a pickup) -> the bar's position on the page,
+    0-based, which is its position among the page's MusicXML measures."""
+    order: dict[str, int] = {}
+    for system in page.iter("system"):
+        for st in system.iter("stack"):
+            sid = st.get("id", "")
+            if st.get("special") != "CAUTIONARY" and sid and sid not in order:
+                order[sid] = len(order)
+    return order
+
+
 @dataclass
 class BookKey:
     """A key signature Audiveris recognised: in the `page`-th page of music
     (0-based, counting every page of every sheet in order) at the start of
-    that page's `measure`-th bar (0-based)."""
+    that page's `measure`-th bar (0-based position on the page)."""
 
     page: int
     measure: int
@@ -552,10 +565,10 @@ def book_keys(book: Path) -> list[BookKey]:
             il = root.find("scale/interline")
             reach = 12 * float(il.get("main", 20)) if il is not None else 240  # a key's width
             for page in root.iter("page"):
+                order = page_bar_order(page)
                 for system in page.iter("system"):
-                    # Bars are numbered from 1 on each page; a cautionary
-                    # stack (courtesy signs at the end of a line) repeats the
-                    # number of the bar before it and is skipped.
+                    # A cautionary stack (courtesy signs at the end of a
+                    # line) repeats the id of the bar before it: skipped.
                     stacks = [(float(st.get("left", 0)), float(st.get("right", 0)), st.get("id", ""))
                               for st in system.iter("stack") if st.get("special") != "CAUTIONARY"]
                     keys = []
@@ -575,8 +588,8 @@ def book_keys(book: Path) -> list[BookKey]:
                                      if s2 == staff and f is not None and x < x2 <= x + reach]
                             fifths = after[0] if after else 0
                         bar = next((sid for left, right, sid in stacks if left - 5 <= x < right), None)
-                        if bar and bar.isdigit():
-                            by_bar.setdefault(int(bar) - 1, []).append(fifths)
+                        if bar in order:
+                            by_bar.setdefault(order[bar], []).append(fifths)
                     for bar, values in sorted(by_bar.items()):
                         out.append(BookKey(page_index, bar, max(set(values), key=values.count)))
                 page_index += 1
@@ -593,7 +606,8 @@ class BarCheck:
     sheet: int  # sheet (page image) number, 1-based
     page: int  # page of music, 0-based over the whole book (as in BookKey)
     system: int  # line of music within the sheet, 0-based
-    bar: int  # bar within the page, 1-based (Audiveris' stack id)
+    bar: int  # Audiveris' id for the bar (its stack id; 0 for a pickup)
+    index: int  # the bar's position on the page, 0-based
     expected: Fraction  # bar length from the time signature Audiveris assumed (whole notes)
     duration: Fraction  # length of the longest voice Audiveris built (whole notes)
     abnormal: bool  # Audiveris flagged its rhythm
@@ -636,6 +650,7 @@ def check_bars(book: Path) -> list[BarCheck]:
                 continue
             system_index = 0
             for page in root.iter("page"):
+                order = page_bar_order(page)
                 for system in page.iter("system"):
                     dropped: dict[str, int] = {}
                     abnormal: set[str] = set()
@@ -656,7 +671,7 @@ def check_bars(book: Path) -> list[BarCheck]:
                         sid = st.get("id", "")
                         if st.get("special") == "CAUTIONARY" or not sid.isdigit():
                             continue
-                        out.append(BarCheck(sheet, page_index, system_index, int(sid),
+                        out.append(BarCheck(sheet, page_index, system_index, int(sid), order[sid],
                                             _fraction(st.get("expected")),
                                             _fraction(st.get("duration")),
                                             sid in abnormal, dropped.get(sid, 0)))
@@ -670,7 +685,8 @@ class MeterFix:
     """A time signature Audiveris missed, put back into its book."""
 
     page: int  # as in BarCheck / BookKey
-    bar: int  # 1-based within the page
+    bar: int  # Audiveris' id for the bar
+    index: int  # the bar's position on the page, 0-based
     beats: int
     beat_type: int
     recovered: int  # chords that now have a place in time (and get exported)
@@ -900,6 +916,6 @@ def repair_meters(audiveris: Path, book: Path, log_path: Path, scratch: Path,
         recovered = _drop_score(bars)[0] - _drop_score(after)[0]
         shutil.copyfile(keep / "score.omr", book)
         exports = sorted(keep.glob("*.mxl"), key=_movement_key)
-        fixes.append(MeterFix(start.page, start.bar, meter[0], meter[1], recovered))
+        fixes.append(MeterFix(start.page, start.bar, start.index, meter[0], meter[1], recovered))
         bars = after
     return fixes, exports

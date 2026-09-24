@@ -7,6 +7,13 @@ Each fixture is a PDF or image with a ground-truth MIDI written by LilyPond
 Scores: pitch F1 (order-aware, ignores rhythm) and, when the file holds a
 single piece, onset F1 (same pitch starting within 1/48 quarter note).
 Results go to <out>/results.json and a table on stdout.
+
+Every case also checks the note ledger (src/sheet2audio/ledger.py): our own
+stages (Audiveris' MusicXML -> our clean-up -> Verovio's score -> playback)
+must not lose a note. A loss there marks the case LEDGER and makes the run
+exit with status 1. Notes Audiveris recognised but did not write out are
+counted too (column 'omr lost'); they are Audiveris' failures, not ours,
+but each must be named in the report's notes.
 """
 
 from __future__ import annotations
@@ -98,7 +105,22 @@ def run_case(name: str, src: Path, gt: list[Path], extra: list[str], out: Path,
                notes=report.get("notes", []))
     if len(gts) == 1 and len(preds) == 1:
         res["onset"] = f1(onset_matches(g, p), len(p), len(g))["f1"]
+    res.update(ledger_check(report))
     return res
+
+
+def ledger_check(report: dict) -> dict:
+    """Our stages must keep every note; Audiveris' losses must be named."""
+    c = report.get("ledger") or {}
+    problems = []
+    for a, b in (("exported", "cleaned"), ("cleaned", "drawn"), ("drawn", "played")):
+        if c.get(a) is not None and c.get(b) is not None and c[b] < c[a]:
+            problems.append(f"{c[a] - c[b]} lost from {a} to {b}")
+    omr_lost = max(0, (c.get("recognised") or 0) - (c.get("exported") or 0))
+    named = any("more note" in n or "could not fit" in n for n in report.get("notes", []))
+    if omr_lost and not named:
+        problems.append(f"{omr_lost} lost by Audiveris without a note to the user")
+    return {"ledger": c, "omr_lost": omr_lost, "ledger_problems": problems}
 
 
 def main() -> None:
@@ -123,7 +145,15 @@ def main() -> None:
     for r in results:
         score = (f"pitch {r['pitch']:.3f}" + (f" onset {r['onset']:.3f}" if "onset" in r else "")
                  if "pitch" in r else f"FAIL: {r.get('error')}")
+        if r.get("omr_lost"):
+            score += f"  omr lost {r['omr_lost']}"
+        if r.get("ledger_problems"):
+            score += "  LEDGER: " + "; ".join(r["ledger_problems"])
         print(f"{r['name']:48s} {r['secs']:6.1f}s  {score}")
+    bad = [r["name"] for r in results if r.get("ledger_problems")]
+    if bad:
+        print(f"\nNote ledger broken in {len(bad)} case(s): {', '.join(bad)}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

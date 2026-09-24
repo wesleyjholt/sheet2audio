@@ -201,6 +201,7 @@ def sanitize(root: ET.Element, source_name: str | None = None) -> list[Note]:
     _order_ties(root)
     _normalize_repeat_barlines(root)
     _share_repeats(root)
+    notes += _drop_orphan_endings(root)
     notes += _drop_empty_measures(root)  # before the repeat fix: it moves barlines
     notes += _align_part_barlines(root)
     notes += _fix_part_mapping(root)
@@ -699,6 +700,60 @@ def _share_repeats(root: ET.Element) -> None:
                 bl.append(copy.deepcopy(rep))
 
 
+def _drop_orphan_endings(root: ET.Element) -> list[Note]:
+    """A 1st-ending bracket means something only when it closes with an
+    end-repeat (and a 2nd ending only right after such a 1st ending).
+    Without one, players take the bracket as 'skip this the first time' and
+    its bars are never played; OMR reads slurs and lines as brackets. Drop
+    those brackets (from each part where they are orphaned)."""
+    notes = []
+    parts = _parts(root)
+    if not parts:
+        return notes
+    n = max(len(p.findall("measure")) for p in parts)
+    back = [any(i < len(p.findall("measure")) and _repeat(p.findall("measure")[i], "right", "backward")
+                for p in parts) for i in range(n)]
+    for pi, part in enumerate(parts):
+        ms = part.findall("measure")
+        spans = []  # (start index, stop index, number, [ending elements])
+        open_: dict[str, tuple[int, list[ET.Element]]] = {}
+        for i, m in enumerate(ms):
+            for bl in m.findall("barline"):
+                for e in bl.findall("ending"):
+                    num = (e.get("number") or "").strip()
+                    if e.get("type") == "start":
+                        if num in open_:  # never closed: an orphan too
+                            j, els = open_.pop(num)
+                            spans.append((j, i - 1, num, els))
+                        open_[num] = (i, [e])
+                    elif num in open_:
+                        j, els = open_.pop(num)
+                        spans.append((j, i, num, els + [e]))
+                    else:
+                        spans.append((i, i, num, [e]))
+        for num, (j, els) in open_.items():
+            spans.append((j, len(ms) - 1, num, els))
+        spans.sort()
+        valid_first_end = -2
+        for start, stop, num, els in spans:
+            first = "1" in re.split(r"[,\s]+", num)
+            closes = next((k for k in range(start, stop + 1) if back[k]), None)
+            ok = (first and closes is not None) or (not first and start == valid_first_end + 1)
+            if first and closes is not None:
+                valid_first_end = closes
+            if ok:
+                continue
+            for e in els:
+                for bl in part.iter("barline"):
+                    if e in list(bl):
+                        bl.remove(e)
+            if pi == 0:
+                notes.append(Note("Measure {m}: removed a 1st/2nd-ending bracket that has no repeat "
+                                  "(probably a line or slur misread); the bars under it would never "
+                                  "have been played.", _ref(ms[start])))
+    return notes
+
+
 def _insert_after_header(m: ET.Element, el: ET.Element) -> None:
     idx = 0
     for idx, child in enumerate(list(m)):
@@ -1147,16 +1202,16 @@ def book_bar_notes(roots: list[ET.Element], fixes, unplaced) -> list[list[Note]]
     pages = _book_pages(roots)
     notes: list[list[Note]] = [[] for _ in roots]
 
-    def where(page: int, bar: int):
+    def where(page: int, position: int):
         if page >= len(pages):
             return None
         r, first, end = pages[page]
-        index = first + bar - 1
+        index = first + position
         ms = _parts(roots[r])[0].findall("measure")
         return (r, ms[index]) if index < end else None
 
     for f in fixes:
-        at = where(f.page, f.bar)
+        at = where(f.page, f.index)
         if at:
             notes[at[0]].append(Note(
                 f"Measure {{m}}: Audiveris missed a change to {f.beats}/{f.beat_type} time here and "
@@ -1164,7 +1219,7 @@ def book_bar_notes(roots: list[ET.Element], fixes, unplaced) -> list[list[Note]]
                 f"the old bar length (on this and the following bars). With {f.beats}/{f.beat_type} "
                 "put back they were read again; check the time signature.", _ref(at[1])))
     for b in unplaced:
-        at = where(b.page, b.bar)
+        at = where(b.page, b.index)
         if at:
             notes[at[0]].append(Note(
                 f"Measure {{m}}: Audiveris recognised {b.dropped} more chord"

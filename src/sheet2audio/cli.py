@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from . import musicxml, omr, synth, tools
+from . import ledger, musicxml, omr, synth, tools
 from .render import (MovementJob, RenderError, channels_needed, combine_midi, describe_parts,
                      in_children,
                      mix_tracks, process_movements, track_names, track_notes)
@@ -342,11 +342,16 @@ def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codec
     read = [musicxml.read_musicxml(mf) for mf in movement_files]
     for root in read:
         musicxml.tag_measures(root)
+    # The note ledger: every stage must keep every note (see ledger.py).
+    counts = {"recognised": None, "exported": sum(ledger.count(r) for r in read)}
     key_notes = [[] for _ in read]
     if audiveris is not None and book:
+        heads = ledger.book_heads(book)
+        counts["recognised"] = sum(heads.values())
         key_notes = musicxml.apply_book_keys(read, omr.book_keys(book))
         bar_notes = musicxml.book_bar_notes(read, res.meter_fixes, res.unplaced)
-        key_notes = [a + b for a, b in zip(key_notes, bar_notes)]
+        loss_notes = ledger.book_loss_notes(read, heads, {(b.page, b.index) for b in res.unplaced})
+        key_notes = [a + b + c for a, b, c in zip(key_notes, bar_notes, loss_notes)]
     for bar, fifths in a.key or []:
         done = musicxml.set_key_at(read, bar, fifths)
         what = musicxml.key_label(fifths)
@@ -428,6 +433,15 @@ def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codec
             notes.append(note(f"no tempo mark was read, so it plays at {r.bpm:g} BPM; "
                               "use --bpm to change it."))
     report["musicxml"] = [str(p) for p in xml_paths]
+    counts["cleaned"] = sum(ledger.count(musicxml.parse(r.xml)) for r in results)
+    counts["drawn"] = sum(r.rendered.count.drawn for r in results if r.rendered.count)
+    counts["played"] = sum(r.rendered.count.played for r in results if r.rendered.count)
+    report["ledger"] = counts
+    if counts["cleaned"] < counts["exported"]:
+        lost = counts["exported"] - counts["cleaned"]
+        notes.append(f"{lost} note{'s' if lost != 1 else ''} went missing in sheet2audio's own "
+                     "clean-up of the recognised score. This is a bug in sheet2audio; please "
+                     "report it with this score.")
     if sum(r.note_count for r in rendered) == 0:
         hint = (f", or open {outdir / 'omr' / 'score.omr'} in Audiveris to see what it found"
                 if audiveris is not None else "")
