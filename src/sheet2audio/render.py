@@ -349,7 +349,9 @@ def process_movement(job: MovementJob) -> MovementResult:
     r = render_musicxml(xml, job.title, bpm=job.bpm, tempo_scale=job.tempo_scale,
                         layout=job.layout, video=job.video, parts_names=job.parts or None,
                         hands=job.hands)
-    return MovementResult(xml=r.xml or xml, rendered=r, notes=report.notes)
+    # After rendering, so the parts carry the names found for them.
+    gaps = musicxml.staff_gaps(musicxml.parse(r.xml or xml, job.title))
+    return MovementResult(xml=r.xml or xml, rendered=r, notes=report.notes + gaps)
 
 
 def _ignore_sigint() -> None:

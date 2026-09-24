@@ -200,6 +200,7 @@ def sanitize(root: ET.Element, source_name: str | None = None) -> list[Note]:
         _renumber_lyrics(root)
     _order_ties(root)
     _normalize_repeat_barlines(root)
+    _share_repeats(root)
     notes += _drop_empty_measures(root)  # before the repeat fix: it moves barlines
     notes += _align_part_barlines(root)
     notes += _fix_part_mapping(root)
@@ -655,6 +656,49 @@ def _normalize_repeat_barlines(root: ET.Element) -> None:
         bs.text = want
 
 
+def _share_repeats(root: ET.Element) -> None:
+    """A repeat sign runs through the whole line of music, but Audiveris
+    writes it only into the parts that have a staff on that line (e.g. the
+    piano, on a line where the voices are not printed yet), and players
+    follow the first part. Give every part the repeats any part has."""
+    parts = _parts(root)
+    measures = [p.findall("measure") for p in parts]
+    for i in range(max((len(ms) for ms in measures), default=0)):
+        wanted = []
+        for ms in measures:
+            if i < len(ms):
+                for bl in ms[i].findall("barline"):
+                    rep = bl.find("repeat")
+                    if rep is not None:
+                        key = (bl.get("location", "right"), rep.get("direction"))
+                        if key not in [k for k, _ in wanted]:
+                            wanted.append((key, rep))
+        for (location, direction), rep in wanted:
+            for ms in measures:
+                if i >= len(ms):
+                    continue
+                m = ms[i]
+                bl = next((b for b in m.findall("barline")
+                           if b.get("location", "right") == location), None)
+                if bl is not None and bl.find("repeat") is not None:
+                    continue
+                if bl is None:
+                    bl = ET.Element("barline", {"location": location})
+                    ET.SubElement(bl, "bar-style").text = (
+                        "light-heavy" if direction == "backward" else "heavy-light")
+                    if location == "left":
+                        _insert_after_header(m, bl)
+                    else:
+                        m.append(bl)
+                else:
+                    bs = bl.find("bar-style")
+                    if bs is None:
+                        bs = ET.Element("bar-style")
+                        bl.insert(0, bs)
+                    bs.text = "light-heavy" if direction == "backward" else "heavy-light"
+                bl.append(copy.deepcopy(rep))
+
+
 def _insert_after_header(m: ET.Element, el: ET.Element) -> None:
     idx = 0
     for idx, child in enumerate(list(m)):
@@ -1080,12 +1124,12 @@ def set_key(root: ET.Element, index: int, fifths: int) -> bool:
     return True
 
 
-def apply_book_keys(roots: list[ET.Element], keys) -> list[list[Note]]:
-    """Put back key changes that Audiveris recognised but left out of its
-    MusicXML (`keys` from omr.book_keys). Audiveris starts a new page of
-    its own at each movement, so pages here are the first bar of each
-    movement and every bar marked new-page."""
-    pages: list[tuple[int, int, int]] = []  # (movement, first bar, bar after the last)
+def _book_pages(roots: list[ET.Element]) -> list[tuple[int, int, int]]:
+    """(movement, first bar, bar after the last) for each page of music, in
+    the order Audiveris' book counts them: it starts a new page of its own
+    at each movement, so pages are the first bar of each movement and every
+    bar marked new-page."""
+    pages: list[tuple[int, int, int]] = []
     for r, root in enumerate(roots):
         parts = _parts(root)
         if not parts:
@@ -1094,6 +1138,45 @@ def apply_book_keys(roots: list[ET.Element], keys) -> list[list[Note]]:
         starts = [i for i, m in enumerate(ms) if i == 0 or any(
             pr.get("new-page") == "yes" for pr in m.findall("print"))]
         pages += [(r, a, b) for a, b in zip(starts, starts[1:] + [len(ms)])]
+    return pages
+
+
+def book_bar_notes(roots: list[ET.Element], fixes, unplaced) -> list[list[Note]]:
+    """Tell the user about time signatures put back into Audiveris' book
+    (omr.MeterFix) and bars where it still left chords out (omr.BarCheck)."""
+    pages = _book_pages(roots)
+    notes: list[list[Note]] = [[] for _ in roots]
+
+    def where(page: int, bar: int):
+        if page >= len(pages):
+            return None
+        r, first, end = pages[page]
+        index = first + bar - 1
+        ms = _parts(roots[r])[0].findall("measure")
+        return (r, ms[index]) if index < end else None
+
+    for f in fixes:
+        at = where(f.page, f.bar)
+        if at:
+            notes[at[0]].append(Note(
+                f"Measure {{m}}: Audiveris missed a change to {f.beats}/{f.beat_type} time here and "
+                f"left out {f.recovered} chord{'s' if f.recovered != 1 else ''} that did not fit "
+                f"the old bar length (on this and the following bars). With {f.beats}/{f.beat_type} "
+                "put back they were read again; check the time signature.", _ref(at[1])))
+    for b in unplaced:
+        at = where(b.page, b.bar)
+        if at:
+            notes[at[0]].append(Note(
+                f"Measure {{m}}: Audiveris recognised {b.dropped} more chord"
+                f"{'s' if b.dropped != 1 else ''} here that it could not fit into the bar's "
+                "rhythm, so they are missing; check this bar.", _ref(at[1])))
+    return notes
+
+
+def apply_book_keys(roots: list[ET.Element], keys) -> list[list[Note]]:
+    """Put back key changes that Audiveris recognised but left out of its
+    MusicXML (`keys` from omr.book_keys)."""
+    pages = _book_pages(roots)
     notes: list[list[Note]] = [[] for _ in roots]
     for k in sorted(keys, key=lambda k: (k.page, k.measure)):
         if k.page >= len(pages):
@@ -1405,6 +1488,77 @@ def _set_time_at(parts: list[ET.Element], index: int, beats: int, beat_type: int
         ET.SubElement(t, "beat-type").text = str(beat_type)
 
 
+_MIN_GAP = Fraction(1, 2)  # quarter notes: holes shorter than an eighth are ignored
+
+
+def staff_gaps(root: ET.Element) -> list[str]:
+    """Bars where a staff has neither notes nor rests for part of the bar.
+
+    Every staff of a bar is filled with notes or rests (hidden rests
+    aside), so a hole means OMR missed a note or a rest there. It cannot be
+    heard as missing when it was a rest, but it cannot be recovered either
+    when it was a note, so the user is asked to check."""
+    notes = []
+    parts = _parts(root)
+    names = {sp.get("id"): (sp.findtext("part-name") or "").strip() for sp in root.iter("score-part")}
+    found = []  # (part, measure index, measure, divisions, {staff: spans})
+    for part in parts:
+        ctx = _part_context(part)
+        for i, m in enumerate(part.findall("measure")):
+            div = ctx[i][0] if i < len(ctx) else 0
+            if not div:
+                continue
+            spans: dict[str, list[tuple[int, int]]] = {}
+            pos = last_start = 0
+            for c in m:
+                if c.tag == "backup":
+                    pos -= _int(c.find("duration"))
+                elif c.tag == "forward":
+                    pos += _int(c.find("duration"))
+                elif c.tag == "note":
+                    if c.find("grace") is not None or c.find("cue") is not None:
+                        continue
+                    dur = _int(c.find("duration"))
+                    start = last_start if c.find("chord") is not None else pos
+                    if c.find("chord") is None:
+                        last_start = pos
+                        pos += dur
+                    staff = (c.findtext("staff") or "1").strip()
+                    spans.setdefault(staff, []).append((start, start + dur))
+            if spans:
+                found.append((part, i, m, div, spans))
+    # The bar lasts as long as its longest staff in any part.
+    bar_q: dict[int, Fraction] = {}
+    for _, i, _, div, spans in found:
+        end = max(Fraction(e, div) for sp in spans.values() for _, e in sp)
+        bar_q[i] = max(bar_q.get(i, Fraction(0)), end)
+    for part, i, m, div, spans in found:
+        staves = max((_int(a.find("staves"), 1) for a in part.iter("attributes")), default=1)
+        length = int(bar_q[i] * div)
+        for staff, sp in sorted(spans.items()):
+            holes, reach = [], 0
+            for a, b in sorted(sp):
+                if a > reach:
+                    holes.append((reach, a))
+                reach = max(reach, b)
+            if reach < length:
+                holes.append((reach, length))
+            holes = [(a, b) for a, b in holes if Fraction(b - a, div) >= _MIN_GAP]
+            if not holes:
+                continue
+            who = names.get(part.get("id")) or part.get("id")
+            if staves > 1:
+                who += " (right hand)" if staff == "1" and staves == 2 else \
+                    " (left hand)" if staff == "2" and staves == 2 else f" (staff {staff})"
+            where = ", ".join(f"beat {_fmt(Fraction(a, div) + 1)}"
+                              + (f"–{_fmt(Fraction(b, div))}" if Fraction(b - a, div) > 1 else "")
+                              for a, b in holes)
+            notes.append(f"Measure {_num(m, i)}: {who} has nothing at {where} (counting quarter "
+                         "notes). Either a rest was not recognised (harmless) or a note was, and "
+                         "is missing; check it.")
+    return notes
+
+
 def repair(root: ET.Element, heard: Callable[[ET.Element], list[Fraction]],
            apply: bool = True) -> RepairReport:
     """Check every bar's played length against its time signature; pad the
@@ -1530,6 +1684,39 @@ def repair(root: ET.Element, heard: Callable[[ET.Element], list[Fraction]],
                              "(not repaired: --no-repair).")
         return rep
 
+    # A lone short bar where three or more staves, in two or more parts, all
+    # stop at the same point is a missed time signature (e.g. one 2/4 bar in
+    # 4/4): OMR missing a rest in every one of them at once is unlikely. (In
+    # both hands of a piano part it is not.) Several bars short by the same
+    # amount are a pattern of lost notes (a bad scan), not a meter: padded.
+    contexts = [_part_context(p) for p in parts]
+    for i in list(todo):
+        ends, with_music = [], 0
+        for p, ctx in zip(parts, contexts):
+            ms = p.findall("measure")
+            if i < len(ms) and ctx[i][0]:
+                staff_end = _Timing(ms[i]).staff_end
+                ends += [Fraction(e, ctx[i][0]) for e in staff_end.values()]
+                with_music += bool(staff_end)
+        beat_type = _beat_type(parts[0], i)
+        beats = lengths[i] * beat_type / 4
+        gap = bars[i] - lengths[i]
+        same_gap = [k for k in todo if k != i and abs(bars[k] - lengths[k] - gap) <= TOL]
+        if same_gap or len(ends) < 3 or with_music < 2 or lengths[i] <= 0 or any(abs(e - lengths[i]) > TOL for e in ends) \
+                or beats.denominator != 1:
+            continue
+        _set_time_at(parts, i, int(beats), beat_type)
+        back = bars[i] * beat_type / 4
+        own_time = i + 1 < n and any(a.find("time") is not None
+                                     for a in measures0[i + 1].findall("attributes"))
+        if i + 1 < n and back.denominator == 1 and not own_time:
+            _set_time_at(parts, i + 1, int(back), beat_type)
+        todo.remove(i)
+        rep.notes.append(f"Measure {num(i)} plays {_fmt(lengths[i])} beats in every staff but the "
+                         f"time signature says {_fmt(bars[i])}: probably a time signature the OMR "
+                         f"missed; using {int(beats)}/{beat_type} for this bar.")
+    if not todo:
+        return rep
     contexts = [_part_context(p) for p in parts]
     originals = {i: [copy.deepcopy(p.findall("measure")[i]) if i < len(p.findall("measure")) else None
                      for p in parts] for i in todo}

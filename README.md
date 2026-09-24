@@ -126,7 +126,8 @@ Timing is sample-accurate between the MIDI, the audio, the video and the page hi
 
 What the tool does about common recognition errors:
 
-- **Too-short bars.** If a bar plays shorter than its time signature (usually a missed rest), a rest is added and the bar is named for you to check. Pickups, bars split by a repeat, and short bars that complete a pickup at a repeat are left alone.
+- **Missed time signatures.** Audiveris can miss a time signature printed in the middle of a line (in one Finale-engraved score it missed all three). When the bars get longer (e.g. 2/4 → 4/4), its rhythm step then silently drops every chord that does not fit, on all the bars that follow. The tool finds the dropped chords in the Audiveris book, puts the time signature back, and lets Audiveris re-time those pages. It keeps the change only if chords come back. Any bar that is still missing chords is named for you to check.
+- **Too-short bars.** If a bar plays shorter than its time signature (usually a missed rest), a rest is added and the bar is named for you to check. If three or more staves all stop at the same point, the bar is treated as a missed time signature instead (e.g. one 2/4 bar in 4/4). Pickups, bars split by a repeat, and short bars that complete a pickup at a repeat are left alone.
 - **Repeats.** Repeats drawn as ":\|\|:" and "A :\| B :\|" are made to play in the order a pianist would.
 - **Recognition debris.** Stray 8va marks and empty bars from courtesy signatures are removed, and you are told where.
 - **Dropped key changes.** Audiveris recognises a key change made of natural signs (e.g. B-flat major → C major) but leaves it out of its MusicXML. The key is read back from the Audiveris book, and the notes after it are re-spelled. For other misses, use `--key`.

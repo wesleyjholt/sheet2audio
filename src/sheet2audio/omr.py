@@ -11,6 +11,7 @@ or blank page), the run is repeated without those pages.
 from __future__ import annotations
 
 import math
+from fractions import Fraction
 import re
 import shutil
 import subprocess
@@ -26,6 +27,10 @@ BOOK_SUFFIX = ".omr"
 MAX_PIXELS = 20_000_000  # org.audiveris.omr.step.LoadStep.maxPixelCount
 C_PDF_RES = "org.audiveris.omr.image.ImageLoading.pdfResolution"
 C_MIN_INTERLINE = "org.audiveris.omr.sheet.ScaleBuilder.minInterline"
+# Audiveris gives up on a page when one step takes over 120 s (its default),
+# which a busy machine can hit; a slow page is better than a failed one.
+C_STEP_TIMEOUT = "org.audiveris.omr.Main.sheetStepTimeOut"
+STEP_TIMEOUT_S = 600
 
 
 class OMRError(RuntimeError):
@@ -39,6 +44,8 @@ class OMRResult:
     log: Path
     pages: int  # pages transcribed
     notes: list[str] = field(default_factory=list)
+    meter_fixes: list = field(default_factory=list)  # MeterFix: time signatures put back
+    unplaced: list = field(default_factory=list)  # BarCheck: bars still missing chords
 
 
 def parse_sheets(spec: str) -> list[int]:
@@ -306,7 +313,8 @@ def _run(audiveris: Path, staged: _Staged, work: Path, log_path: Path,
     for old in work.iterdir():
         if old.suffix.lower() == ".mxl":
             old.unlink()
-    cmd = [str(audiveris), "-batch", "-export", "-output", str(work)]
+    cmd = [str(audiveris), "-batch", "-export", "-output", str(work),
+           "-constant", f"{C_STEP_TIMEOUT}={STEP_TIMEOUT_S}"]
     for k, v in staged.constants.items():
         cmd += ["-constant", f"{k}={v}"]
     cmd += ["--", str(staged.path)]
@@ -344,6 +352,15 @@ def run_audiveris(audiveris: Path, source: Path, outdir: Path, sheets: list[int]
                 _keep_book(work, omr_dir, source)
                 raise OMRError(_failure_message(log, code, log_path, staged))
             staged = retry
+        meter_fixes, unplaced = [], []
+        books = sorted(work.rglob("*.omr"))
+        if books:
+            scratch = tmp / "meters"
+            scratch.mkdir()
+            meter_fixes, exports = repair_meters(audiveris, books[0], log_path, scratch, timeout)
+            if exports:
+                mxls = exports
+            unplaced = [b for b in check_bars(books[0]) if b.dropped]
         movements = []
         for i, m in enumerate(mxls, 1):
             dest = omr_dir / ("score.mxl" if len(mxls) == 1 else f"score.mvt{i}.mxl")
@@ -354,7 +371,8 @@ def run_audiveris(audiveris: Path, source: Path, outdir: Path, sheets: list[int]
         notes.append("Audiveris could not tell the movements apart; some may be missing.")
     notes += _log_notes(log)
     return OMRResult(movements=movements, book=book, log=log_path,
-                     pages=len(staged.pages or []) or 1, notes=notes)
+                     pages=len(staged.pages or []) or 1, notes=notes,
+                     meter_fixes=meter_fixes, unplaced=unplaced)
 
 
 def _keep_book(work: Path, omr_dir: Path, source: Path) -> Path | None:
@@ -563,3 +581,325 @@ def book_keys(book: Path) -> list[BookKey]:
                         out.append(BookKey(page_index, bar, max(set(values), key=values.count)))
                 page_index += 1
     return out
+
+
+# ---------------------------------------------------------------- bars Audiveris could not time
+
+
+@dataclass
+class BarCheck:
+    """One bar (a 'stack' across all staves) as Audiveris' rhythm step saw it."""
+
+    sheet: int  # sheet (page image) number, 1-based
+    page: int  # page of music, 0-based over the whole book (as in BookKey)
+    system: int  # line of music within the sheet, 0-based
+    bar: int  # bar within the page, 1-based (Audiveris' stack id)
+    expected: Fraction  # bar length from the time signature Audiveris assumed (whole notes)
+    duration: Fraction  # length of the longest voice Audiveris built (whole notes)
+    abnormal: bool  # Audiveris flagged its rhythm
+    dropped: int  # chords recognised but left out: no place in time, so not exported
+
+
+def _fraction(text: str | None) -> Fraction:
+    try:
+        return Fraction(text or "0")
+    except (ValueError, ZeroDivisionError):
+        return Fraction(0)
+
+
+def _book_sheets(z) -> list[str]:
+    return sorted((n for n in z.namelist() if re.fullmatch(r"sheet#(\d+)/sheet#\1\.xml", n)),
+                  key=lambda n: int(re.search(r"#(\d+)", n).group(1)))
+
+
+def check_bars(book: Path) -> list[BarCheck]:
+    """Every bar of an Audiveris book with its rhythm verdict, in score order.
+
+    Audiveris fits each bar's chords into voices against the length the
+    time signature gives. Chords that do not fit get no time offset, and its
+    MusicXML export silently leaves them out; this finds them."""
+    import xml.etree.ElementTree as ET
+    import zipfile
+
+    out: list[BarCheck] = []
+    try:
+        z = zipfile.ZipFile(book)
+    except (OSError, zipfile.BadZipFile):
+        return out
+    page_index = 0
+    with z:
+        for name in _book_sheets(z):
+            sheet = int(re.search(r"#(\d+)", name).group(1))
+            try:
+                root = ET.fromstring(z.read(name))
+            except ET.ParseError:
+                continue
+            system_index = 0
+            for page in root.iter("page"):
+                for system in page.iter("system"):
+                    dropped: dict[str, int] = {}
+                    abnormal: set[str] = set()
+                    for part in system.findall("part"):
+                        for m in part.findall("measure"):
+                            mid = m.get("id", "")
+                            chords = set()
+                            for tag in ("head-chords", "rest-chords"):
+                                for e in m.findall(tag):
+                                    chords |= set((e.text or "").split())
+                            timed = {v.get("chord") for v in m.iter("value")}
+                            for v in m.findall("voice"):
+                                timed |= set(v.attrib.values())  # e.g. measure-rest-chord
+                            dropped[mid] = dropped.get(mid, 0) + len(chords - timed)
+                            if m.get("abnormal") == "true":
+                                abnormal.add(mid)
+                    for st in system.iter("stack"):
+                        sid = st.get("id", "")
+                        if st.get("special") == "CAUTIONARY" or not sid.isdigit():
+                            continue
+                        out.append(BarCheck(sheet, page_index, system_index, int(sid),
+                                            _fraction(st.get("expected")),
+                                            _fraction(st.get("duration")),
+                                            sid in abnormal, dropped.get(sid, 0)))
+                    system_index += 1
+                page_index += 1
+    return out
+
+
+@dataclass
+class MeterFix:
+    """A time signature Audiveris missed, put back into its book."""
+
+    page: int  # as in BarCheck / BookKey
+    bar: int  # 1-based within the page
+    beats: int
+    beat_type: int
+    recovered: int  # chords that now have a place in time (and get exported)
+
+
+_WHOLE_TIMES = {"COMMON_TIME": (4, 4), "CUT_TIME": (2, 2)}
+_STEPS_AFTER_LINKS = ("RHYTHMS", "PAGE")
+
+
+def _meter_before(root_sheets, target: BarCheck) -> tuple[int, int] | None:
+    """The last time signature Audiveris recognised at or before `target`."""
+    found = None
+    for sheet, root in root_sheets:
+        page_systems = [s for p in root.iter("page") for s in p.iter("system")]
+        for si, system in enumerate(page_systems):
+            if (sheet, si) > (target.sheet, target.system):
+                return found
+            stacks = {st.get("id"): (float(st.get("left", 0)), float(st.get("right", 0)))
+                      for st in system.iter("stack")}
+            for t in system.iter():
+                if t.tag not in ("time-pair", "time-whole") or t.find("bounds") is None:
+                    continue
+                x = float(t.find("bounds").get("x", 0))
+                bar = next((int(k) for k, (l, r) in stacks.items() if k.isdigit() and l - 5 <= x < r),
+                           None)
+                if (sheet, si) == (target.sheet, target.system) and (bar is None or bar > target.bar):
+                    continue
+                rational = t.get("time-rational") or ""
+                m = re.fullmatch(r"(\d+)/(\d+)", rational)
+                if m:
+                    found = (int(m.group(1)), int(m.group(2)))
+                elif t.get("shape") in _WHOLE_TIMES:
+                    found = _WHOLE_TIMES[t.get("shape")]
+                else:
+                    m = re.fullmatch(r"TIME_(\w+)_(\w+)", t.get("shape") or "")
+                    words = {"TWO": 2, "THREE": 3, "FOUR": 4, "FIVE": 5, "SIX": 6, "SEVEN": 7,
+                             "EIGHT": 8, "NINE": 9, "TWELVE": 12, "SIXTEEN": 16}
+                    if m and m.group(1) in words and m.group(2) in words:
+                        found = (words[m.group(1)], words[m.group(2)])
+    return found
+
+
+def _meter_for(length: Fraction, beat_type: int) -> tuple[int, int] | None:
+    """A time signature whose bar lasts `length` whole notes, preferring `beat_type`."""
+    for bt in (beat_type, 4, 8, 2, 16):
+        beats = length * bt
+        if beats.denominator == 1 and 1 <= beats <= 16:
+            return int(beats), bt
+    return None
+
+
+def _inject_time(src: Path, dest: Path, target: BarCheck, beats: int, beat_type: int) -> bool:
+    """Copy the book `src` to `dest` with a time signature `beats/beat_type`
+    at the start of `target`'s bar on every staff of its line, and with every
+    page from that sheet on set back to just before the rhythm step (so
+    Audiveris re-times them, and nothing else, when asked for the PAGE step)."""
+    import xml.etree.ElementTree as ET
+    import zipfile
+
+    with zipfile.ZipFile(src) as z:
+        name = f"sheet#{target.sheet}/sheet#{target.sheet}.xml"
+        try:
+            root = ET.fromstring(z.read(name))
+        except (KeyError, ET.ParseError):
+            return False
+        systems = [s for p in root.iter("page") for s in p.iter("system")]
+        if target.system >= len(systems):
+            return False
+        system = systems[target.system]
+        stack = next((st for st in system.iter("stack")
+                      if st.get("id") == str(target.bar) and st.get("special") != "CAUTIONARY"), None)
+        inters = system.find("sig/inters")
+        if stack is None or inters is None:
+            return False
+        measures = [(part, m) for part in system.findall("part") for m in part.findall("measure")
+                    if m.get("id") == str(target.bar)]
+        if not measures or any(m.find("times") is not None for _, m in measures):
+            return False  # a time signature is already there
+        last = int(root.get("last-persistent-id", "0") or 0)
+        il = root.find("scale/interline")
+        interline = float(il.get("main", 20)) if il is not None else 20.0
+        left = float(stack.get("left", 0))
+        ids: dict[str, int] = {}
+        for staff in system.iter("staff"):
+            ys = [float(p.get("y")) for line in staff.iter("line") for p in line.iter("point")]
+            if not staff.get("id") or not ys:
+                continue
+            last += 1
+            ids[staff.get("id")] = last
+            t = ET.Element("time-pair", {"time-rational": f"{beats}/{beat_type}", "grade": "0.9",
+                                         "ctx-grade": "0.9", "staff": staff.get("id"), "id": str(last)})
+            ET.SubElement(t, "bounds", {"x": str(int(left + interline / 2)), "y": str(int(min(ys))),
+                                        "w": str(int(interline * 1.7)),
+                                        "h": str(int(max(ys) - min(ys)))})
+            inters.insert(0, t)
+        for part, m in measures:
+            staff_ids = [ids[s.get("id")] for s in part.findall("staff") if s.get("id") in ids]
+            if not staff_ids:
+                return False
+            times = ET.Element("times")
+            times.text = " ".join(map(str, staff_ids))
+            barline = m.find("right-barline")
+            m.insert(list(m).index(barline) + 1 if barline is not None else 0, times)
+        root.set("last-persistent-id", str(last))
+        book_xml = z.read("book.xml").decode("utf-8")
+
+        def reset(match):
+            number = int(match.group(1))
+            body = match.group(2)
+            if number >= target.sheet:
+                body = re.sub(r"<steps>([^<]*)</steps>", lambda s: "<steps>" + " ".join(
+                    w for w in s.group(1).split() if w not in _STEPS_AFTER_LINKS) + "</steps>", body)
+            return f'<sheet number="{match.group(1)}"' + body
+
+        book_xml = re.sub(r'<sheet number="(\d+)"(.*?)(?=<sheet number=|</book>)', reset, book_xml,
+                          flags=re.S)
+        with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as out:
+            for item in z.infolist():
+                data = z.read(item.filename)
+                if item.filename == name:
+                    data = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' \
+                        + ET.tostring(root, encoding="utf-8")
+                elif item.filename == "book.xml":
+                    data = book_xml.encode("utf-8")
+                out.writestr(item, data)
+    return True
+
+
+def _drop_score(bars: list[BarCheck]) -> tuple[int, int]:
+    return sum(b.dropped for b in bars), sum(b.abnormal for b in bars)
+
+
+def _long_runs(bars: list[BarCheck]) -> list[list[int]]:
+    """Runs of 2+ consecutive bars where chords were dropped or a voice ran
+    long: what a missed time signature (to a longer bar) looks like. A lone
+    bar is more likely a misread rhythm."""
+    runs, run = [], []
+    for i, b in enumerate(bars):
+        if b.dropped or (b.abnormal and b.duration > b.expected):
+            run.append(i)
+        else:
+            if len(run) >= 2:
+                runs.append(run)
+            run = []
+    if len(run) >= 2:
+        runs.append(run)
+    return runs
+
+
+def repair_meters(audiveris: Path, book: Path, log_path: Path, scratch: Path,
+                  timeout: float | None = None,
+                  max_trials: int = 8) -> tuple[list[MeterFix], list[Path]]:
+    """Find time signatures Audiveris missed (its rhythm step then drops the
+    chords that do not fit the old bar length) and put them back: add the
+    time signature to the book, let Audiveris re-time the pages from there,
+    and keep the change only if fewer chords are dropped. Returns the fixes
+    and the new MusicXML exports (empty if nothing changed; they live in
+    `scratch`); `book` is updated in place."""
+    import xml.etree.ElementTree as ET
+    import zipfile
+
+    fixes: list[MeterFix] = []
+    exports: list[Path] = []
+    bars = check_bars(book)
+    tried: set[tuple[int, int]] = set()
+    trials = 0
+    while trials < max_trials:
+        runs = [r for r in _long_runs(bars) if (bars[r[0]].page, bars[r[0]].bar) not in tried]
+        if not runs:
+            break
+        run = runs[0]
+        start = bars[run[0]]
+        tried.add((start.page, start.bar))
+        with zipfile.ZipFile(book) as z:
+            sheets = []
+            for n in _book_sheets(z):
+                try:
+                    sheets.append((int(re.search(r"#(\d+)", n).group(1)), ET.fromstring(z.read(n))))
+                except ET.ParseError:
+                    pass
+        old = _meter_before(sheets, start)
+        beat_type = old[1] if old else 4
+        longer = [bars[i].duration for i in run if bars[i].duration > bars[i].expected]
+        lengths = sorted(set(longer), key=lambda d: (-longer.count(d), d))
+        lengths += [x for x in (start.expected * 2, start.expected * 3 / 2) if x not in lengths]
+        best = None
+        for length in lengths[:3]:
+            meter = _meter_for(length, beat_type)
+            if meter is None or trials >= max_trials:
+                continue
+            trials += 1
+            with tempfile.TemporaryDirectory(prefix="meter-", dir=scratch) as tmp_name:
+                trial = Path(tmp_name) / "score.omr"
+                if not _inject_time(book, trial, start, *meter):
+                    continue
+                cmd = [str(audiveris), "-batch", "-step", "PAGE", "-export", "-save",
+                       "-constant", f"{C_STEP_TIMEOUT}={STEP_TIMEOUT_S}",
+                       "-output", tmp_name, "--", str(trial)]
+                with open(log_path, "a") as log:
+                    log.write(f"\n==== sheet2audio: trying {meter[0]}/{meter[1]} at sheet "
+                              f"{start.sheet} bar {start.bar}\n")
+                    log.flush()
+                    try:
+                        subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, timeout=timeout)
+                    except subprocess.TimeoutExpired:
+                        continue
+                after = check_bars(trial)
+                mxls = sorted(Path(tmp_name).rglob("*.mxl"), key=_movement_key)
+                if not mxls or len(after) != len(bars):
+                    continue
+                # A real bar length makes whole bars of the run come out clean;
+                # a wrong one that merely fits more (e.g. misread specks) does not.
+                clean = sum(1 for i in run if not after[i].dropped and not after[i].abnormal)
+                if clean >= 2 and _drop_score(after)[0] < _drop_score(bars)[0] and \
+                        (best is None or _drop_score(after) < _drop_score(best[1])):
+                    keep = scratch / f"best{trials}"
+                    keep.mkdir()
+                    shutil.copyfile(trial, keep / "score.omr")
+                    for m in mxls:
+                        shutil.copyfile(m, keep / m.name)
+                    best = (meter, after, keep)
+                    if not any(after[i].dropped for i in run):
+                        break  # this bar length fits the whole run
+        if best is None:
+            continue
+        meter, after, keep = best
+        recovered = _drop_score(bars)[0] - _drop_score(after)[0]
+        shutil.copyfile(keep / "score.omr", book)
+        exports = sorted(keep.glob("*.mxl"), key=_movement_key)
+        fixes.append(MeterFix(start.page, start.bar, meter[0], meter[1], recovered))
+        bars = after
+    return fixes, exports

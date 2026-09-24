@@ -906,3 +906,85 @@ def test_key_override_by_measure_number_and_key_names():
     assert _spelled(root, 1) == _spelled(root, 2) == ["F#", "C#", "G"]
     assert mx.set_key_at([root], "3", 2) == "same"
     assert mx.set_key_at([root], "9", 2) == "missing"
+
+
+def test_lone_bar_short_in_every_staff_of_a_choir_is_a_missed_time_signature():
+    # Three staves (voice + piano) all stop after 2 of 4 beats: a 2/4 bar, not missed rests.
+    parts = []
+    for pid, staves in (("P1", 1), ("P2", 2)):
+        bars = []
+        for i in range(1, 5):
+            beats = 2 if i == 3 else 4
+            body = note("C", 5, 2 * beats, "half" if beats == 2 else "whole")
+            if staves == 2:
+                body += backup(2 * beats) + note("C", 3, 2 * beats, "half" if beats == 2 else "whole",
+                                                 staff="2")
+            attr = ""
+            if i == 1:
+                attr = ("<attributes><divisions>2</divisions><key><fifths>0</fifths></key>"
+                        "<time><beats>4</beats><beat-type>4</beat-type></time>"
+                        f"<staves>{staves}</staves></attributes>")
+            bars.append(f'<measure number="{i}">{attr}{body}</measure>')
+        parts.append(f'<part id="{pid}">{"".join(bars)}</part>')
+    xml = ('<?xml version="1.0" encoding="UTF-8"?><score-partwise version="4.0"><part-list>'
+           '<score-part id="P1"><part-name>Voice</part-name></score-part>'
+           '<score-part id="P2"><part-name>Piano</part-name></score-part></part-list>'
+           + "".join(parts) + "</score-partwise>").encode()
+    root = mx.parse(xml)
+    rep = mx.repair(root, _heard_from_root)
+    assert rep.padded == []
+    for part in root.findall("part"):
+        ms = part.findall("measure")
+        assert ms[2].find("attributes/time/beats").text == "2"
+        assert ms[3].find("attributes/time/beats").text == "4"
+    assert _heard_from_root(root) == [4, 4, 2, 4]
+
+
+def test_a_repeat_in_one_part_is_shared_by_all_parts():
+    # The first line has only the piano: Audiveris writes the start-repeat into its part only.
+    fwd = '<barline location="left"><bar-style>heavy-light</bar-style><repeat direction="forward"/></barline>'
+    back = '<barline location="right"><bar-style>light-heavy</bar-style><repeat direction="backward"/></barline>'
+    parts = []
+    for pid, extra2, extra3 in (("P1", "", back), ("P2", fwd, back)):
+        bars = []
+        for i in range(1, 4):
+            attr = ("<attributes><divisions>1</divisions><time><beats>1</beats><beat-type>4</beat-type>"
+                    "</time></attributes>") if i == 1 else ""
+            body = {2: extra2, 3: extra3}.get(i, "")
+            if i == 2:
+                body = body + note("C", 5, 1, "quarter")
+            else:
+                body = note("C", 5, 1, "quarter") + body
+            bars.append(f'<measure number="{i}">{attr}{body}</measure>')
+        parts.append(f'<part id="{pid}">{"".join(bars)}</part>')
+    xml = ('<?xml version="1.0" encoding="UTF-8"?><score-partwise version="4.0"><part-list>'
+           '<score-part id="P1"><part-name>Voice</part-name></score-part>'
+           '<score-part id="P2"><part-name>Piano</part-name></score-part></part-list>'
+           + "".join(parts) + "</score-partwise>").encode()
+    root = mx.parse(xml)
+    mx.sanitize(root)
+    m2 = root.find("part").findall("measure")[1]
+    assert m2.find("barline/repeat").get("direction") == "forward"
+    assert m2.find("barline").get("location") == "left"
+    # Played: 1, 2, 3, 2, 3 (not back to bar 1).
+    assert _heard_from_root(root) == [1, 1, 1]
+    tk = verovio.toolkit()
+    tk.loadData(mx.to_bytes(root).decode())
+    ons = [e for e in tk.renderToTimemap({"includeMeasures": True}) if "measureOn" in e]
+    assert len(ons) == 5
+
+
+def test_a_staff_with_a_hole_is_named_but_rests_and_second_voices_are_not():
+    full = note("C", 5, 8, "whole") + backup(8) + note("C", 3, 8, "whole", staff="2")
+    # Bar 2: the left hand only starts on beat 3 (Audiveris writes a <forward> for what it missed).
+    hole = (note("C", 5, 8, "whole") + backup(8) + "<forward><duration>4</duration></forward>"
+            + note("C", 3, 4, "half", staff="2"))
+    # Bar 3: a second voice that starts late is fine: the staff is covered by voice 1.
+    voices = (note("C", 5, 8, "whole") + backup(4) + note("E", 4, 4, "half", voice="2")
+              + backup(8) + note("C", 3, 8, "whole", staff="2"))
+    # Bar 4: a rest counts as written.
+    rest = (note("C", 5, 8, "whole") + backup(8)
+            + "<note><rest/><duration>8</duration><voice>5</voice><type>whole</type><staff>2</staff></note>")
+    root = mx.parse(score([full, hole, voices, rest], beats=4))
+    gaps = mx.staff_gaps(root)
+    assert len(gaps) == 1 and gaps[0].startswith("Measure 2: Piano (left hand) has nothing at beat 1–2")

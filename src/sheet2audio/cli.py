@@ -345,6 +345,8 @@ def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codec
     key_notes = [[] for _ in read]
     if audiveris is not None and book:
         key_notes = musicxml.apply_book_keys(read, omr.book_keys(book))
+        bar_notes = musicxml.book_bar_notes(read, res.meter_fixes, res.unplaced)
+        key_notes = [a + b for a, b in zip(key_notes, bar_notes)]
     for bar, fifths in a.key or []:
         done = musicxml.set_key_at(read, bar, fifths)
         what = musicxml.key_label(fifths)
