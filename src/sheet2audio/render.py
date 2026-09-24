@@ -273,8 +273,12 @@ def render_musicxml(xml: bytes, title: str, bpm: float | None = None, tempo_scal
         tracks = _tracks(tk.getMEI(), part_entries, hands, warnings)
     duration, ring, notes = _midi_extent(midi)
     # The last note starts at the same moment in the MIDI and in the timemap,
-    # unless something (e.g. an absurd tempo) broke the MIDI timing.
-    tm_last = max((e["tstamp"] for e in raw_timemap if e.get("on")), default=0.0) / 1000.0
+    # unless something (e.g. an absurd tempo) broke the MIDI timing. The
+    # timemap also lists a tied note where it continues; the MIDI does not.
+    tied = ledger.tie_continuations(tk.getMEI())
+    tm_last = max((e["tstamp"] for e in raw_timemap
+                   if any(ledger.base_id(i) not in tied for i in e.get("on", []))),
+                  default=0.0) / 1000.0
     midi_last = _last_note_on(midi)
     if notes and abs(tm_last - midi_last) > max(0.05, 0.01 * midi_last):
         warnings.append(f"The audio and the note highlighting disagree ({midi_last:.1f} s vs "

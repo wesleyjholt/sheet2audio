@@ -104,6 +104,18 @@ def count(root: ET.Element) -> int:
     return sum(musicxml_notes(root))
 
 
+def tie_continuations(mei: str) -> set[str]:
+    """Ids of notes that continue a tie (they do not sound again)."""
+    tree = ET.fromstring(mei)
+    ids = {t.get("endid", "").lstrip("#") for t in tree.iter(MEI + "tie")}
+    return ids | {n.get(XML_ID) for n in tree.iter(MEI + "note") if n.get("tie") in ("m", "t")}
+
+
+def base_id(timemap_id: str) -> str:
+    """A note id from Verovio's timemap without its repeat-pass suffix."""
+    return _REND.sub("", timemap_id)
+
+
 @dataclass
 class RenderCount:
     cleaned: int  # notes in the MusicXML given to Verovio
@@ -123,14 +135,14 @@ def render_count(xml: bytes, mei: str, timemap: list[dict]) -> RenderCount:
         if root.find("part") is not None else []
     tree = ET.fromstring(mei)
     measures = list(tree.iter(MEI + "measure"))
-    ties = {t.get("endid", "").lstrip("#") for t in tree.iter(MEI + "tie")}
-    played_ids = {_REND.sub("", i) for e in timemap for i in e.get("on", [])}
+    ties = tie_continuations(mei)
+    played_ids = {base_id(i) for e in timemap for i in e.get("on", [])}
     drawn = played = 0
     lost, silent = [], []
     for i, m in enumerate(measures):
         notes = list(m.iter(MEI + "note"))
         drawn += len(notes)
-        sounding = [n for n in notes if n.get(XML_ID) not in ties and n.get("tie") not in ("m", "t")]
+        sounding = [n for n in notes if n.get(XML_ID) not in ties]
         heard = sum(1 for n in sounding if n.get(XML_ID) in played_ids)
         played += heard + (len(notes) - len(sounding))
         label = labels[i] if i < len(labels) else m.get("n", str(i + 1))

@@ -1084,3 +1084,29 @@ def test_ending_brackets_without_a_repeat_are_dropped_and_real_ones_kept():
     # Every bar is played: 1 2 3 4 5 | 1 2 3 4 6 7 after the repeat back to the start.
     r = render_musicxml(mx.to_bytes(root), "t")
     assert not r.count.silent
+
+
+def test_a_tenth_part_is_not_played_on_the_drum_channel():
+    ids = [f"P{k}" for k in range(1, 11)]
+    plist = "".join(f'<score-part id="{i}"><part-name>Voice</part-name><midi-instrument id="{i}-I1">'
+                    f'<midi-channel>{k}</midi-channel><midi-program>1</midi-program></midi-instrument>'
+                    f'</score-part>' for k, i in enumerate(ids, 1))
+    attr = ("<attributes><divisions>2</divisions><time><beats>3</beats><beat-type>4</beat-type>"
+            "</time></attributes>")
+    body = "".join(f'<part id="{i}"><measure number="1">{attr}{FULL}</measure></part>' for i in ids)
+    root = root_of(('<?xml version="1.0" encoding="UTF-8"?><score-partwise version="4.0">'
+                    f'<part-list>{plist}</part-list>{body}</score-partwise>').encode())
+    sanitize(root)
+    channels = [mi.findtext("midi-channel") for mi in root.iter("midi-instrument")]
+    assert "10" not in channels and len(set(channels)) == 10
+    midi = mido.MidiFile(file=io.BytesIO(render_musicxml(mx.to_bytes(root), "t").midi))
+    assert not any(m.type == "note_on" and m.channel == 9 for t in midi.tracks for m in t)
+
+
+def test_a_piece_ending_on_a_tie_gets_no_timing_warning():
+    # Verovio's timemap lists the tied continuation of the last chord as a
+    # new note; the MIDI does not. That is not a timing error.
+    from pathlib import Path
+    src = Path(__file__).parent / "fixtures" / "engravers" / "spring_procession.musicxml"
+    r = render_musicxml(src.read_bytes(), "t")
+    assert not any("disagree" in w for w in r.warnings)

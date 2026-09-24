@@ -199,6 +199,7 @@ def sanitize(root: ET.Element, source_name: str | None = None) -> list[Note]:
     if audiveris:
         _renumber_lyrics(root)
     _order_ties(root)
+    _off_drum_channel(root)
     _normalize_repeat_barlines(root)
     _share_repeats(root)
     notes += _drop_orphan_endings(root)
@@ -655,6 +656,23 @@ def _normalize_repeat_barlines(root: ET.Element) -> None:
             bs = ET.Element("bar-style")
             bl.insert(0, bs)
         bs.text = want
+
+
+def _off_drum_channel(root: ET.Element) -> None:
+    """Audiveris numbers MIDI channels by part, so a 10th part gets channel
+    10, which General MIDI reserves for drums: its notes turn into drum
+    hits (or vanish). Move pitched parts to a free channel."""
+    parts = {p.get("id"): p for p in _parts(root)}
+    instruments = [(sp.get("id"), mi) for sp in root.iter("score-part")
+                   for mi in sp.findall("midi-instrument")]
+    used = {(mi.findtext("midi-channel") or "").strip() for _, mi in instruments}
+    free = [c for c in range(1, 17) if c != 10 and str(c) not in used] or [1]
+    for k, (pid, mi) in enumerate(i for i in instruments
+                                  if (i[1].findtext("midi-channel") or "").strip() == "10"):
+        part = parts.get(pid)
+        if part is None or part.find(".//unpitched") is not None:
+            continue  # a real percussion part
+        mi.find("midi-channel").text = str(free[k % len(free)])
 
 
 def _share_repeats(root: ET.Element) -> None:
