@@ -1455,15 +1455,25 @@ def _key_in_effect(measures: list[ET.Element], index: int) -> int | None:
     return fifths
 
 
-def _respell(measures: list[ET.Element], fifths: int) -> None:
-    """Spell every note from the key signature and the accidentals printed
-    before it in its bar (as notation defines them). A tied-over note takes
-    the pitch of the note it is tied from; one tied from before `measures`
-    keeps its pitch."""
-    tied: dict[tuple[str, str, str], int] = {}  # pitch of the latest tie start
-    for m in measures:
+def _respell(measures: list[ET.Element], fifths: int, staff: str | None = None) -> None:
+    """Spell every note (of `staff`, or all) from the key signature and the
+    accidentals printed before it in its bar (as notation defines them). A
+    tied-over note takes the pitch of the note it is tied from; one tied
+    from before `measures` keeps its pitch."""
+    groups = [[n for n in m.findall("note")
+               if staff is None or (n.findtext("staff") or "1").strip() == staff] for m in measures]
+    _spell(groups, [fifths] * len(groups))
+
+
+def _spell(groups: list[list[ET.Element]], keys: list[int],
+           tied_in: dict[tuple[str, str, str], int] | None = None) -> None:
+    """The spelling rule of _respell over the notes of consecutive bars
+    (one list per bar, in order), each bar in its own key. `tied_in` gives
+    the alteration of notes tied into the first bar from before it."""
+    tied: dict[tuple[str, str, str], int] = dict(tied_in or {})  # latest tie start
+    for notes, fifths in zip(groups, keys):
         carried: dict[tuple[str, str, str], int] = {}
-        for n in m.findall("note"):
+        for n in notes:
             p = n.find("pitch")
             if p is None:
                 continue
@@ -1596,6 +1606,144 @@ def apply_book_keys(roots: list[ET.Element], keys) -> list[list[Note]]:
                               "Audiveris recognised it but left it out of its export, so it was "
                               "put back and the notes after it re-spelled.", _ref(ms[index])))
     return notes
+
+
+_CLEF_NAMES = {"treble": ("G", 2, 0), "g": ("G", 2, 0), "bass": ("F", 4, 0), "f": ("F", 4, 0),
+               "alto": ("C", 3, 0), "c": ("C", 3, 0), "tenor": ("C", 4, 0),
+               "treble8vb": ("G", 2, -1), "tenor-treble": ("G", 2, -1), "treble8va": ("G", 2, 1),
+               "bass8vb": ("F", 4, -1), "soprano": ("C", 1, 0), "baritone": ("F", 3, 0)}
+_CLEF_PITCH = {"G": 4 * 7 + 4, "F": 3 * 7 + 3, "C": 4 * 7 + 0}  # G4, F3, C4 as diatonic numbers
+_STEPS = "CDEFGAB"
+
+
+def parse_clef(text: str) -> tuple[str, int, int]:
+    """'treble', 'bass', 'alto', 'tenor', 'treble8vb' ... -> (sign, line, octave change)."""
+    key = text.strip().lower().replace(" ", "").replace("_", "")
+    if key not in _CLEF_NAMES:
+        raise ValueError(f"unknown clef '{text}' (use {', '.join(sorted(_CLEF_NAMES))})")
+    return _CLEF_NAMES[key]
+
+
+def _bottom_line(clef: tuple[str, int, int]) -> int:
+    """Diatonic number of the pitch on a staff's bottom line under `clef`."""
+    sign, line, octave = clef
+    return _CLEF_PITCH[sign] + 7 * octave - 2 * (line - 1)
+
+
+def _clef_of(c: ET.Element) -> tuple[str, int, int] | None:
+    sign = (c.findtext("sign") or "").strip().upper()
+    if sign not in _CLEF_PITCH:
+        return None
+    return sign, _int(c.find("line"), {"G": 2, "F": 4, "C": 3}[sign]), _int(c.find("clef-octave-change"))
+
+
+def _find_part(root: ET.Element, query: str) -> ET.Element | None:
+    parts = _parts(root)
+    q = query.strip()
+    if q.isdigit() and 1 <= int(q) <= len(parts):
+        return parts[int(q) - 1]
+    names = {sp.get("id"): (sp.findtext("part-name") or "").strip() for sp in root.iter("score-part")}
+    for p in parts:
+        name = names.get(p.get("id"), "")
+        if name.lower() == q.lower() or _same_name(name, q) or p.get("id", "").lower() == q.lower():
+            return p
+    return None
+
+
+def set_clef_at(root: ET.Element, number: str, part: str, staff: int,
+                clef: tuple[str, int, int]) -> str:
+    """Read one staff in `clef` from the start of the bar numbered `number`
+    until that staff's next clef (wherever it is, mid-bar too): each note
+    keeps its place on the staff and takes the pitch that place has in the
+    new clef, spelled from the key in effect in its bar and the accidentals
+    printed before it (a note tied in from before takes the pitch of the
+    note it is tied from). For a clef change OMR did not see. The clef is
+    written at the start of the bar even when it is the clef already read
+    there ('same'), so that it ends the range of an earlier --clef.
+    Returns 'set', 'same', 'no part', 'no staff' or 'no bar'."""
+    p = _find_part(root, part)
+    if p is None:
+        return "no part"
+    staves = max((_int(a.find("staves"), 1) for a in p.iter("attributes")), default=1)
+    if not 1 <= staff <= staves:
+        return "no staff"
+    ms = p.findall("measure")
+    index = next((i for i, m in enumerate(ms) if m.get("number", "").strip() == number), None)
+    if index is None:
+        return "no bar"
+    st = str(staff)
+
+    def ours(c: ET.Element) -> bool:
+        return c.tag == "clef" and (c.get("number") or "1") == st
+
+    old = ("G", 2, 0)  # MusicXML's default
+    for m in ms[:index]:
+        for c in m.iter("clef"):
+            if ours(c):
+                old = _clef_of(c) or old
+    first = ms[index]
+    children = list(first)
+    head = next((k for k, c in enumerate(children) if c.tag in ("note", "backup", "forward")),
+                len(children))
+    leading = [c for c in children[:head] if c.tag == "attributes"]
+    for block in leading:  # the bar's own clef at its start is the one being corrected
+        for c in [c for c in block.findall("clef") if ours(c)]:
+            old = _clef_of(c) or old
+            block.remove(c)
+    if leading:
+        attrs = leading[0]
+    else:
+        attrs = ET.Element("attributes")
+        _insert_after_header(first, attrs)
+    el = ET.Element("clef", {"number": st})
+    ET.SubElement(el, "sign").text = clef[0]
+    ET.SubElement(el, "line").text = str(clef[1])
+    if clef[2]:
+        ET.SubElement(el, "clef-octave-change").text = str(clef[2])
+    at = sum(1 for c in attrs if c.tag in ("footnote", "level", "divisions", "key", "time",
+                                           "staves", "part-symbol", "instruments", "clef"))
+    attrs.insert(at, el)
+    if old == clef:
+        return "same"
+    shift = _bottom_line(clef) - _bottom_line(old)
+    groups: list[list[ET.Element]] = []
+    keys: list[int] = []
+    done = False
+    for j in range(index, len(ms)):
+        notes = []
+        for c in ms[j]:
+            if c.tag == "attributes" and c is not attrs and any(ours(x) for x in c.findall("clef")):
+                done = True  # the staff's next clef
+                break
+            if c.tag == "note" and (c.findtext("staff") or "1").strip() == st:
+                notes.append(c)
+        groups.append(notes)
+        keys.append(_key_in_effect(ms, j) or 0)
+        if done:
+            break
+    for n in (n for g in groups for n in g):
+        pitch = n.find("pitch")
+        rest = n.find("rest")
+        if pitch is not None:
+            step, octave = pitch.find("step"), pitch.find("octave")
+        elif rest is not None and rest.find("display-step") is not None:
+            step, octave = rest.find("display-step"), rest.find("display-octave")
+        else:
+            continue
+        if step is None or octave is None:
+            continue
+        d = _int(octave) * 7 + _STEPS.index((step.text or "C").strip()) + shift
+        step.text, octave.text = _STEPS[d % 7], str(d // 7)
+    tied_in = {}
+    if index > 0:  # notes tied into the range keep the pitch of the note before
+        for n in ms[index - 1].findall("note"):
+            if (n.findtext("staff") or "1").strip() == st and n.find("pitch") is not None \
+                    and any(t.get("type") == "start" for t in n.findall("tie")):
+                pt = n.find("pitch")
+                tied_in[(st, (pt.findtext("step") or "").strip(),
+                         (pt.findtext("octave") or "").strip())] = _int(pt.find("alter"))
+    _spell(groups, keys, tied_in)
+    return "set"
 
 
 def set_key_at(roots: list[ET.Element], number: str, fifths: int) -> str:

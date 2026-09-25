@@ -1594,3 +1594,103 @@ def test_joining_parts_never_swaps_a_bar_for_an_empty_one():
     sanitize(root)
     assert len(root.findall("part")) == 1
     assert root.find("part").findall("measure")[2].find("note/rest") is not None
+
+
+def test_a_missed_clef_change_is_put_back_and_the_staff_re_read():
+    # D major; the left hand switches to treble clef at bar 2 but OMR read bars 2-3
+    # in bass clef (F#2+C#3 for the printed D4+A4); bar 4 has its own bass clef again.
+    lh = lambda step, octave, alter="": (
+        f"<note><pitch><step>{step}</step>{f'<alter>{alter}</alter>' if alter else ''}"
+        f"<octave>{octave}</octave></pitch><duration>6</duration><voice>5</voice>"
+        "<type>half</type><dot/><staff>2</staff></note>")
+    rh = note("A", 4, 6, "half", dot=True) + backup(6)
+    bars = [rh + lh("D", 3), rh + lh("F", 2, 1), rh + lh("C", 3, 1),
+            '<attributes><clef number="2"><sign>F</sign><line>4</line></clef></attributes>' + rh + lh("D", 3)]
+    xml = score(bars).replace(b"<fifths>0</fifths>", b"<fifths>2</fifths>")
+    root = root_of(xml)
+    assert mx.set_clef_at(root, "2", "Piano", 2, mx.parse_clef("treble")) == "set"
+    got = []
+    for m in root.find("part").findall("measure"):
+        n = [x for x in m.findall("note") if x.findtext("staff") == "2"][0]
+        got.append(n.findtext("pitch/step") + (n.findtext("pitch/alter") or "") + n.findtext("pitch/octave"))
+    assert got == ["D3", "D4", "A4", "D3"]
+    assert root.find("part").findall("measure")[1].find("attributes/clef/sign").text == "G"
+    assert mx.set_clef_at(root, "2", "Piano", 2, mx.parse_clef("treble")) == "same"
+    assert mx.set_clef_at(root, "2", "Violin", 2, mx.parse_clef("treble")) == "no part"
+    assert mx.set_clef_at(root, "9", "Piano", 2, mx.parse_clef("treble")) == "no bar"
+    assert mx.set_clef_at(root, "2", "Piano", 3, mx.parse_clef("treble")) == "no staff"
+
+
+def _lh_score(bars: list[str], fifths: int = 0) -> ET.Element:
+    """Piano (2 staves), 3/4, divisions 2; `bars` are left-hand bodies (staff 2),
+    each preceded by a whole-bar right-hand note."""
+    rh = note("A", 4, 6, "half", dot=True) + backup(6)
+    xml = score([rh + b for b in bars]).replace(b"<fifths>0</fifths>", f"<fifths>{fifths}</fifths>".encode(), 1)
+    return root_of(xml)
+
+
+def _lh(step, octave, dur=2, typ="quarter", alter=None, tie=None):
+    a = f"<alter>{alter}</alter>" if alter is not None else ""
+    t = f'<tie type="{tie}"/>' if tie else ""
+    return (f"<note><pitch><step>{step}</step>{a}<octave>{octave}</octave></pitch><duration>{dur}</duration>"
+            f"{t}<voice>5</voice><type>{typ}</type><staff>2</staff></note>")
+
+
+def _lh_pitches(root) -> list[list[str]]:
+    out = []
+    for m in root.find("part").findall("measure"):
+        out.append([n.findtext("pitch/step") + {"1": "#", "-1": "b"}.get(n.findtext("pitch/alter") or "", "")
+                    + n.findtext("pitch/octave") for n in m.findall("note")
+                    if n.findtext("staff") == "2" and n.find("pitch") is not None])
+    return out
+
+
+_BASS_MID = '<attributes><clef number="2"><sign>F</sign><line>4</line></clef></attributes>'
+_TREBLE = mx.parse_clef("treble")
+
+
+def test_clef_override_ends_at_the_staffs_next_clef_even_mid_bar():
+    # Bar 3: two quarters, then a mid-bar bass clef, then D3: the first two are re-read.
+    root = _lh_score([_lh("D", 3) * 3, _lh("G", 2) * 3, _lh("G", 2) * 2 + _BASS_MID + _lh("D", 3)])
+    assert mx.set_clef_at(root, "2", "Piano", 2, _TREBLE) == "set"
+    assert _lh_pitches(root) == [["D3"] * 3, ["E4"] * 3, ["E4", "E4", "D3"]]
+
+
+def test_a_mid_bar_clef_in_the_target_bar_is_kept_and_ends_the_range():
+    root = _lh_score([_lh("D", 3) * 3, _lh("G", 2) * 2 + _BASS_MID + _lh("D", 3), _lh("D", 3) * 3])
+    assert mx.set_clef_at(root, "2", "Piano", 2, _TREBLE) == "set"
+    assert _lh_pitches(root) == [["D3"] * 3, ["E4", "E4", "D3"], ["D3"] * 3]
+    m2 = root.find("part").findall("measure")[1]
+    signs = [c.findtext("sign") for c in m2.iter("clef")]
+    assert signs == ["G", "F"]  # the new one at the start, the printed bass one kept
+    assert list(m2).index(m2.findall("attributes")[0]) < list(m2).index(m2.find("note"))
+
+
+def test_clef_override_spells_each_bar_in_its_own_key_and_follows_ties():
+    # D major, then C major from bar 3. Bar 1 ends on D4 tied into bar 2, where the
+    # treble clef begins but OMR read bass (the tied D4 as F#2).
+    key_c = '<attributes><key><fifths>0</fifths></key></attributes>'
+    root = _lh_score([_lh("D", 4, 6, "half", tie="start").replace("<type>half</type>", "<type>half</type><dot/>"),
+                      _lh("F", 2, 2, alter=1, tie="stop") + _lh("A", 3) * 2,
+                      key_c + _lh("A", 3) * 3], fifths=2)
+    assert mx.set_clef_at(root, "2", "Piano", 2, _TREBLE) == "set"
+    assert _lh_pitches(root) == [["D4"], ["D4", "F#5", "F#5"], ["F5", "F5", "F5"]]
+
+
+def test_clef_given_where_the_staff_already_is_still_bounds_an_earlier_one():
+    # Treble in bars 2-3, bass again from bar 4; OMR saw neither. Either order works.
+    for items in ((("2", _TREBLE), ("4", mx.parse_clef("bass"))),
+                  (("4", mx.parse_clef("bass")), ("2", _TREBLE))):
+        root = _lh_score([_lh("D", 3) * 3, _lh("G", 2) * 3, _lh("G", 2) * 3, _lh("D", 3) * 3, _lh("D", 3) * 3])
+        for bar, clef in sorted(items, key=lambda c: int(c[0]), reverse=True):  # as the CLI does
+            mx.set_clef_at(root, bar, "Piano", 2, clef)
+        assert _lh_pitches(root) == [["D3"] * 3, ["E4"] * 3, ["E4"] * 3, ["D3"] * 3, ["D3"] * 3]
+
+
+def test_clef_override_moves_rest_positions_too():
+    rest = ('<note><rest><display-step>D</display-step><display-octave>3</display-octave></rest>'
+            '<duration>2</duration><voice>5</voice><type>quarter</type><staff>2</staff></note>')
+    root = _lh_score([_lh("D", 3) * 3, rest + _lh("G", 2) * 2])
+    mx.set_clef_at(root, "2", "Piano", 2, _TREBLE)
+    r = root.find("part").findall("measure")[1].find("note/rest")
+    assert (r.findtext("display-step"), r.findtext("display-octave")) == ("B", "4")

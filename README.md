@@ -93,6 +93,7 @@ uv run sheet2audio piece.pdf --bpm 80            # starting tempo (quarter notes
 uv run sheet2audio piece.pdf --tempo-scale 0.75  # 75 % of the printed tempo
 uv run sheet2audio piece.pdf --time 3/4          # time signature, if none was recognised
 uv run sheet2audio piece.pdf --key 29:C          # a key change OMR missed (29:C,41:Eb; Am for minor)
+uv run sheet2audio piece.pdf --clef 14:Piano:2:treble   # a clef change OMR missed (part, staff from the top)
 uv run sheet2audio piece.pdf --sheets "1 3-4"    # only some pages
 uv run sheet2audio piece.pdf --formats mp3,m4a,flac
 uv run sheet2audio piece.pdf --no-video          # faster; skip the MP4
@@ -105,9 +106,9 @@ Input can also be an image (`.png`, `.jpg`, `.tif`, `.bmp`, `.gif`, `.webp`, inc
 
 ## How accurate is it?
 
-The pipeline was checked against 122 test files, each with known correct notes.
+The pipeline was checked against 140 test files, each with known correct notes.
 
-- **Test files:** original pieces engraved with LilyPond, plus scanned and degraded copies of them.
+- **Test files:** original pieces engraved with LilyPond, plus scanned and degraded copies of them. There are also 15 choral scores (two voice staves with lyrics, plus piano) engraved by Verovio in five music fonts and by MuseScore. Audiveris reads these about as well as it reads real Finale, Sibelius and Dorico output, which is worse than it reads LilyPond.
 - **Musical features covered:** repeats, first and second endings, D.C. al Fine, pickups, ties, tuplets, 6/8 and 9/8, two voices per hand, clef changes, several pieces in one PDF, and multi-page scores.
 - **Scan conditions covered:** 75–600 dpi, rotation, noise, JPEG artefacts, uneven light, phone-photo simulations, blank pages, and CMYK, 16-bit and WebP images.
 
@@ -121,6 +122,7 @@ The table below gives the share of notes with the right pitch, in the right orde
 | Mild phone-photo simulation (6) | 97 % | 94–98 % |
 | Harsh phone-photo simulation: noise, blur, skew and shadows together (12) | 41 % | 19–57 %: use a scanner app instead |
 | 75 dpi (2) | — | 33 % or no result |
+| Choral scores engraved by Verovio (5 fonts) and MuseScore (15) | 99 % | 82–100 %. Timing median 98 %; one at 56 % (time-signature digits read as notes). See `docs/known-failures.md` |
 
 Timing is sample-accurate between the MIDI, the audio, the video and the page highlighting. The audio lags the MIDI by 2–3 ms, and the MP3 by 0 samples.
 
@@ -131,6 +133,9 @@ What the tool does about common recognition errors:
 - **Repeats.** Repeats drawn as ":\|\|:" and "A :\| B :\|" are made to play in the order a pianist would.
 - **Recognition debris.** Stray 8va marks and empty bars from courtesy signatures are removed, and you are told where.
 - **Dropped key changes.** Audiveris recognises a key change made of natural signs (e.g. B-flat major → C major) but leaves it out of its MusicXML. The key is read back from the Audiveris book, and the notes after it are re-spelled. For other misses, use `--key`.
+- **Parts split by their printed name.** Audiveris makes a new part whenever a part's name is printed differently (e.g. 'Part II' on the first line, 'II' after it). Such parts are joined again.
+- **1st/2nd-ending brackets.** Brackets are made the same in every part, misread brackets (often lyric extenders) are removed, a misread number is corrected, and a 2nd ending that was not read is assumed after a 1st ending.
+- **Rests or dots OMR missed inside a bar.** When one staff ends early while the others fill the bar, the missing time is put back where its notes line up again with the other staves on the page. When a staff runs past the bar line while the others fit, it is cut back to the bar line. Every note removed this way is named.
 - **Tempo written as text.** Something like "= 132" is used as the tempo.
 - **Several pieces on one page** are split, each with its own tempo.
 

@@ -81,6 +81,23 @@ def _key_changes(text: str) -> list[tuple[str, int]]:
     return out
 
 
+def _clef_changes(text: str) -> list[tuple[str, str, int, tuple[str, int, int]]]:
+    out = []
+    for item in filter(None, (t.strip() for t in text.split(","))):
+        bits = [b.strip() for b in item.split(":")]
+        if len(bits) != 4 or not bits[0].isdigit() or not bits[2].isdigit() or not bits[1] \
+                or int(bits[2]) < 1:
+            raise argparse.ArgumentTypeError(
+                f"use MEASURE:PART:STAFF:CLEF, e.g. 14:Piano:2:treble (got '{item}')")
+        try:
+            out.append((str(int(bits[0])), bits[1], int(bits[2]), musicxml.parse_clef(bits[3])))
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(str(e)) from None
+    if not out:
+        raise argparse.ArgumentTypeError("use MEASURE:PART:STAFF:CLEF, e.g. 14:Piano:2:treble")
+    return out
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="sheet2audio",
@@ -101,7 +118,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
                        default=1.0, help="multiply every tempo by this (e.g. 0.8 = slower)")
     p.add_argument("--time", type=_time_sig, metavar="N/D",
                    help="time signature to use if OMR read none, e.g. 3/4")
-    p.add_argument("--key", type=_key_changes, metavar="MEASURE:KEY",
+    p.add_argument("--clef", type=_clef_changes, action="extend", metavar="MEASURE:PART:STAFF:CLEF",
+                   help="a clef change OMR missed, e.g. 14:Piano:2:treble (the piano's lower "
+                        "staff reads in treble clef from measure 14 until its next clef); PART "
+                        "is the part's name or number, STAFF counts from 1 at the top of the part")
+    p.add_argument("--key", type=_key_changes, action="extend", metavar="MEASURE:KEY",
                    help="key changes OMR missed, e.g. 29:C or 29:C,41:Eb (Am etc. for minor); "
                         "the notes from there on are re-spelled")
     p.add_argument("--soundfont", help="SoundFont (.sf2/.sf3) to play the music with")
@@ -382,6 +403,23 @@ def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codec
         titles.append(t if t and t not in titles else (f"Movement {i}" if multi else stem))
     for sn, first, pieces in file_notes:
         notes += musicxml.resolve_notes(sn, pieces, titles[first:first + len(pieces)])
+    # --clef after the split (parts joined, pieces apart), on the first piece
+    # with that bar and part; later bars first, so each ends the range of the
+    # ones before it.
+    for bar, part, staff, clef in sorted(a.clef or [], key=lambda c: int(c[0]), reverse=True):
+        done, title = "no part", ""
+        for root, title in zip(roots, titles):
+            done = musicxml.set_clef_at(root, bar, part, staff, clef)
+            if done in ("set", "same"):
+                break
+        where = f"{title}: " if multi and done in ("set", "same") else ""
+        notes.append({"set": f"{where}Measure {bar}: {part} staff {staff} is read in the clef given "
+                             "with --clef, from there to its next clef.",
+                      "same": f"{where}Measure {bar}: {part} staff {staff} already reads in that "
+                              "clef; marked it there.",
+                      "no part": f"--clef: no part named '{part}'.",
+                      "no staff": f"--clef: {part} has no staff {staff}.",
+                      "no bar": f"--clef: {part} has no measure {bar}."}[done])
     for root in roots:
         musicxml.untag(root)
 
