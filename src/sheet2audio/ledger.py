@@ -2,6 +2,8 @@
 
     recognised  noteheads Audiveris found (its book)
     exported    notes in Audiveris' MusicXML
+    removed     notes the repair removed on purpose (each named for the user)
+    added       notes the repair added by splitting a note into tied values
     cleaned     notes in our MusicXML, after clean-up and repair
     drawn       notes in Verovio's score (what the page and video show)
     played      notes Verovio plays (the audio, MIDI and highlighting)

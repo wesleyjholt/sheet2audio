@@ -310,6 +310,11 @@ def plan_groups(root: ET.Element, names: list[str] | None = None,
                     wanted = [w for w in wanted if "/" not in w]
                 x = stats.get(s, _StaffStats())
                 divided = bool(x.events) and x.multi / x.events >= 0.10
+                if not wanted and not source and not given and label and not divided and k == 1:
+                    # A printed name with no voice word in it ('Part II', 'I',
+                    # 'Descant') is the part's name; a bare number is a part number.
+                    wanted = [f"Part {label}" if re.fullmatch(r"[IVXLC]+|\d+", label.strip())
+                              else label.strip()]
                 if len(wanted) == 1 and divided and label and _DIVISI.search(label):
                     wanted = [f"{wanted[0]} 1", f"{wanted[0]} 2"]  # 'Soprano 1/2', 'div.'
                 elif len(wanted) == 1 and not given and divided and not _names_in(label):

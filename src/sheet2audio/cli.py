@@ -376,7 +376,9 @@ def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codec
     multi = len(roots) > 1
     titles = []
     for i, root in enumerate(roots, 1):
-        t = musicxml.title_of(root) if multi else None
+        # A file name like '9b6192_807e1b4b...' says nothing: use the printed title.
+        machine_named = bool(re.fullmatch(r"[0-9a-f_\-]{16,}", stem.lower()))
+        t = musicxml.title_of(root) if multi or machine_named else None
         titles.append(t if t and t not in titles else (f"Movement {i}" if multi else stem))
     for sn, first, pieces in file_notes:
         notes += musicxml.resolve_notes(sn, pieces, titles[first:first + len(pieces)])
@@ -433,12 +435,14 @@ def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codec
             notes.append(note(f"no tempo mark was read, so it plays at {r.bpm:g} BPM; "
                               "use --bpm to change it."))
     report["musicxml"] = [str(p) for p in xml_paths]
+    counts["removed"] = sum(r.removed for r in results)  # on purpose, named in the notes
+    counts["added"] = sum(r.added for r in results)  # a note split into tied values
     counts["cleaned"] = sum(ledger.count(musicxml.parse(r.xml)) for r in results)
     counts["drawn"] = sum(r.rendered.count.drawn for r in results if r.rendered.count)
     counts["played"] = sum(r.rendered.count.played for r in results if r.rendered.count)
     report["ledger"] = counts
-    if counts["cleaned"] < counts["exported"]:
-        lost = counts["exported"] - counts["cleaned"]
+    if counts["cleaned"] - counts["added"] + counts["removed"] < counts["exported"]:
+        lost = counts["exported"] - counts["removed"] - counts["cleaned"] + counts["added"]
         notes.append(f"{lost} note{'s' if lost != 1 else ''} went missing in sheet2audio's own "
                      "clean-up of the recognised score. This is a bug in sheet2audio; please "
                      "report it with this score.")
@@ -546,7 +550,8 @@ def _run(a, log, src, suffix, outdir, stem, fluidsynth, ffmpeg, soundfont, codec
             player = Player(samples=sheet, layout=layout, silent=silent,
                             voice_program=voice_program,
                             programs={n: programs[n] for n in names}, downloads=downloads)
-            write_viewer(html_path, stem, movs, player, notes, end_s, embed_audio=not link)
+            page_title = titles[0] if len(titles) == 1 and titles[0] != stem else stem
+            write_viewer(html_path, page_title, movs, player, notes, end_s, embed_audio=not link)
             report["viewer"] = str(html_path)
             if link:
                 sheet.unlink(missing_ok=True)  # the page reads the .js copy

@@ -194,10 +194,109 @@ def test_parts_that_disagree_on_barlines_are_rebarred():
     assert abs(r.duration_s - 4 * 1.5) < 0.01
 
 
-def test_overfull_measure_is_reported_not_changed():
+def test_a_staff_running_past_the_bar_line_is_cut_back_when_the_other_fills_it():
+    # 3/4: the right hand's whole note is a dotted half whose dot was missed.
     over = note("C", 5, 8, "whole") + backup(8) + note("C", 3, 6, "half", staff="2", dot=True)
-    rep = mx.repair(root_of(score([FULL, over, FULL])), _heard_from_root)
-    assert rep.overfull == ["2"] and rep.padded == []
+    root = root_of(score([FULL, over, FULL]))
+    rep = mx.repair(root, _heard_from_root)
+    assert rep.trimmed == ["2"] and rep.overfull == [] and rep.removed == 0
+    rh = root.find("part").findall("measure")[1].find("note")
+    assert (rh.findtext("duration"), rh.findtext("type"), rh.find("dot") is not None) == ("6", "half", True)
+    assert _heard_from_root(root) == [3, 3, 3]
+
+
+def test_an_overfull_bar_is_left_alone_when_most_staves_agree_with_each_other():
+    # Two of three staves run to 4 beats in 3/4: not a misread staff (a missed meter, say).
+    over = (note("C", 5, 8, "whole") + backup(8) + note("C", 3, 8, "whole", staff="2"))
+    third = note("E", 4, 6, "half", dot=True, voice="2")
+    root = root_of(score([FULL, over + backup(8) + third, FULL]))
+    rep = mx.repair(root, _heard_from_root)
+    assert rep.overfull == ["2"] and rep.trimmed == []
+
+
+def test_cutting_back_removes_notes_past_the_bar_line_and_keeps_later_voices_in_time():
+    # 3/4: right hand quarter, half, quarter (4 beats); left hand dotted half.
+    rh = note("C", 5, 2, "quarter") + note("D", 5, 4, "half") + note("E", 5, 2, "quarter")
+    over = rh + backup(8) + note("C", 3, 6, "half", staff="2", dot=True)
+    root = root_of(score([FULL, over, FULL]))
+    rep = mx.repair(root, _heard_from_root)
+    assert rep.trimmed == ["2"] and rep.removed == 1
+    m = root.find("part").findall("measure")[1]
+    assert [n.findtext("pitch/step") for n in m.findall("note")] == ["C", "D", "C"]
+    assert m.find("backup/duration").text == "6"
+    assert _heard_from_root(root) == [3, 3, 3]
+
+
+def test_cutting_back_a_note_to_a_length_with_no_single_value_ties_two_values():
+    # 4/4: eighth + whole (4.5 beats) against a whole note: the whole becomes dotted half + eighth, tied.
+    rh = note("C", 5, 1, "eighth") + note("D", 5, 8, "whole")
+    four = note("C", 5, 8, "whole") + backup(8) + note("C", 3, 8, "whole", staff="2")
+    root = root_of(score([four, rh + backup(9) + note("C", 3, 8, "whole", staff="2"), four], beats=4))
+    rep = mx.repair(root, _heard_from_root)
+    assert rep.trimmed == ["2"] and rep.removed == 0
+    notes = [n for n in root.find("part").findall("measure")[1].findall("note")
+             if n.findtext("staff") == "1"]
+    assert [(n.findtext("type"), n.find("dot") is not None) for n in notes] == \
+        [("eighth", False), ("half", True), ("eighth", False)]
+    assert [t.get("type") for t in notes[1].findall("tie")] == ["start"]
+    assert [t.get("type") for t in notes[2].findall("tie")] == ["stop"]
+    assert _heard_from_root(root) == [4, 4, 4]
+
+
+def _parts_score(bars_by_part: list[tuple[str, int, list[str]]], beats=3, mattrs=None) -> bytes:
+    """[(part name, staves, [measure bodies])] -> a score-partwise document."""
+    plist, body = "", ""
+    for k, (name, staves, bars) in enumerate(bars_by_part, 1):
+        plist += f'<score-part id="P{k}"><part-name>{name}</part-name></score-part>'
+        ms = []
+        for i, b in enumerate(bars, 1):
+            attr = (f"<attributes><divisions>2</divisions><time><beats>{beats}</beats>"
+                    f"<beat-type>4</beat-type></time><staves>{staves}</staves></attributes>"
+                    if i == 1 else "")
+            extra = (mattrs or {}).get(i, "")
+            ms.append(f'<measure number="{i}"{extra}>{attr}{b}</measure>')
+        body += f'<part id="P{k}">{"".join(ms)}</part>'
+    return ('<?xml version="1.0" encoding="UTF-8"?><score-partwise version="4.0">'
+            f'<part-list>{plist}</part-list>{body}</score-partwise>').encode()
+
+
+def _mrest(duration, staff="1"):
+    return (f'<note><rest measure="yes"/><duration>{duration}</duration><voice>1</voice>'
+            f'<staff>{staff}</staff></note>')
+
+
+def test_a_hidden_staffs_whole_bar_rest_does_not_block_padding():
+    # 2/4; bar 2 lost a trailing eighth rest in the voice and both piano staves.
+    # A hidden choir part has a whole-bar rest as long as Audiveris read the bar (1.5 beats).
+    full_v = note("C", 5, 4, "half")
+    full_p = note("C", 4, 4, "half") + backup(4) + note("C", 3, 4, "half", staff="2")
+    short_v = note("C", 5, 2, "quarter") + note("D", 5, 1, "eighth")
+    short_p = (note("C", 4, 2, "quarter") + note("D", 4, 1, "eighth") + backup(3)
+               + note("C", 3, 2, "quarter", staff="2") + note("D", 3, 1, "eighth", staff="2"))
+    root = root_of(_parts_score([
+        ("Voice", 1, [full_v, short_v, full_v, full_v]),
+        ("Choir", 1, [_mrest(4), _mrest(3), _mrest(4), _mrest(4)]),
+        ("Piano", 2, [full_p, short_p, full_p, full_p])], beats=2))
+    rep = mx.repair(root, _heard_from_root)
+    assert rep.padded == ["2"] and rep.unfixed == []
+    assert _heard_from_root(root) == [2, 2, 2, 2]
+    assert not any("Choir" in g for g in mx.staff_gaps(root))
+
+
+def test_a_first_bar_most_staves_agree_is_short_is_a_pickup_even_unmarked():
+    # 4/4, bar 1 not marked implicit: voice and left hand play 1 beat, the right
+    # hand 1.25 (a missed 16th flag). A pickup of 1 beat; the right hand is fitted.
+    whole_v = note("C", 5, 8, "whole")
+    whole_p = note("C", 4, 8, "whole") + backup(8) + note("C", 3, 8, "whole", staff="2")
+    pick_v = note("G", 4, 2, "quarter")
+    pick_p = (note("G", 4, 1, "eighth") + note("A", 4, 1, "eighth") + note("B", 4, 1, "eighth")
+              + backup(3) + note("G", 3, 2, "quarter", staff="2"))
+    root = root_of(_parts_score([("Voice", 1, [pick_v, whole_v, whole_v]),
+                                 ("Piano", 2, [pick_p, whole_p, whole_p])], beats=4))
+    rep = mx.repair(root, _heard_from_root)
+    assert rep.padded == [] and rep.removed == 1
+    assert any("is a pickup of 1 beats" in n for n in rep.notes)
+    assert _heard_from_root(root) == [1, 4, 4]
 
 
 def test_time_signature_change_is_respected():
@@ -1079,7 +1178,8 @@ def test_ending_brackets_without_a_repeat_are_dropped_and_real_ones_kept():
     notes = sanitize(root)
     ends = [(m.get("number"), e.get("number"), e.get("type"))
             for m in root.iter("measure") for e in m.iter("ending")]
-    assert ends == [("5", "1", "start"), ("5", "1", "stop"), ("6", "2", "start")]
+    assert ends == [("5", "1", "start"), ("5", "1", "stop"), ("6", "2", "start"),
+                    ("6", "2", "discontinue")]  # its end was not read: one bar
     assert any("removed a 1st/2nd-ending bracket" in n for n in notes)
     # Every bar is played: 1 2 3 4 5 | 1 2 3 4 6 7 after the repeat back to the start.
     r = render_musicxml(mx.to_bytes(root), "t")
@@ -1110,3 +1210,387 @@ def test_a_piece_ending_on_a_tie_gets_no_timing_warning():
     src = Path(__file__).parent / "fixtures" / "engravers" / "spring_procession.musicxml"
     r = render_musicxml(src.read_bytes(), "t")
     assert not any("disagree" in w for w in r.warnings)
+
+
+def test_ending_brackets_are_merged_across_parts_and_renumbered():
+    # As OMR delivers a choir + piano score: the voice part (first) has a lyric
+    # extender read as a bracket at bar 2 and nothing else; the piano has the
+    # real brackets, with the 2nd ending misread as '1'; the repeat is shared.
+    def bl(loc, *inner):
+        return f'<barline location="{loc}">{"".join(inner)}</barline>'
+    fwd = '<repeat direction="forward"/>'
+    back = '<repeat direction="backward"/>'
+    q = note("C", 5, 6, "half", dot=True)
+    voice = [q, bl("left", '<ending number="1" type="start"/>') + q, q, q, q, q]
+    piano = [q, bl("left", fwd) + q, q,
+             bl("left", '<ending number="1" type="start"/>') + q
+             + bl("right", '<ending number="1" type="stop"/>', back),
+             bl("left", '<ending number="1" type="start"/>') + q
+             + bl("right", '<ending number="1" type="discontinue"/>'), q]
+    parts = []
+    for pid, bars in (("P1", voice), ("P2", piano)):
+        ms = []
+        for i, body in enumerate(bars, 1):
+            attr = ("<attributes><divisions>2</divisions><time><beats>3</beats>"
+                    "<beat-type>4</beat-type></time></attributes>") if i == 1 else ""
+            ms.append(f'<measure number="{i}">{attr}{body}</measure>')
+        parts.append(f'<part id="{pid}">{"".join(ms)}</part>')
+    root = root_of(('<?xml version="1.0" encoding="UTF-8"?><score-partwise version="4.0"><part-list>'
+                    '<score-part id="P1"><part-name>Voice</part-name></score-part>'
+                    '<score-part id="P2"><part-name>Piano</part-name></score-part></part-list>'
+                    + "".join(parts) + "</score-partwise>").encode())
+    notes = sanitize(root)
+    for part in root.findall("part"):
+        ends = [(m.get("number"), e.get("number"), e.get("type"))
+                for m in part.iter("measure") for e in m.iter("ending")]
+        assert ends == [("4", "1", "start"), ("4", "1", "stop"),
+                        ("5", "2", "start"), ("5", "2", "discontinue")]
+    assert any("it is ending 2" in n for n in notes)
+    # Played: 1 2 3 4 | 2 3 5 6 (8 bars).
+    tk = verovio.toolkit()
+    tk.loadData(mx.to_bytes(root).decode())
+    ons = [e["measureOn"] for e in tk.renderToTimemap({"includeMeasures": True}) if "measureOn" in e]
+    assert len(ons) == 8
+
+
+# ---------------------------------------------------------------- review regressions (items 1-3)
+
+
+def _play_order(root) -> list[str]:
+    """Measure numbers in the order Verovio plays them."""
+    tk = verovio.toolkit()
+    tk.loadData(mx.to_bytes(root).decode())
+    mei = ET.fromstring(tk.getMEI())
+    ns = "{http://www.music-encoding.org/ns/mei}"
+    xid = "{http://www.w3.org/XML/1998/namespace}id"
+    num = {m.get(xid): m.get("n") for m in mei.iter(ns + "measure")}
+    return [num.get(re.sub(r"(-rend\d+)+$", "", e["measureOn"]))
+            for e in tk.renderToTimemap({"includeMeasures": True}) if "measureOn" in e]
+
+
+def _bl(loc, *inner):
+    return f'<barline location="{loc}">{"".join(inner)}</barline>'
+
+
+_Q = note("C", 5, 6, "half", dot=True)
+_E1 = '<ending number="1" type="start"/>'
+_BACK = '<repeat direction="backward"/>'
+_FWD = '<repeat direction="forward"/>'
+
+
+def test_an_open_2nd_ending_does_not_swallow_the_next_section():
+    # ||: 1 2 3 |1. 4 :|2. 5 (bracket left open) | 6 7 ||: 8 9 |1. 10 :|2. 11 | 12
+    bars = [_Q, _Q, _Q, _bl("left", _E1) + _Q + _bl("right", '<ending number="1" type="stop"/>', _BACK),
+            _bl("left", '<ending number="2" type="start"/>') + _Q, _Q, _Q,
+            _bl("left", _FWD) + _Q, _Q,
+            _bl("left", _E1) + _Q + _bl("right", '<ending number="1" type="stop"/>', _BACK),
+            _bl("left", '<ending number="2" type="start"/>') + _Q
+            + _bl("right", '<ending number="2" type="discontinue"/>'), _Q]
+    root = root_of(score(bars))
+    sanitize(root)
+    assert _play_order(root) == "1 2 3 4 1 2 3 5 6 7 8 9 10 8 9 11 12".split()
+
+
+def test_a_1st_ending_whose_2nd_bracket_was_missed_still_repeats():
+    bars = [_Q, _Q, _Q, _bl("left", _E1) + _Q + _bl("right", '<ending number="1" type="stop"/>', _BACK),
+            _Q, _Q]
+    root = root_of(score(bars))
+    notes = sanitize(root)
+    assert _play_order(root) == "1 2 3 4 1 2 3 5 6".split()
+    assert any("assumed ending 2 starts here" in n for n in notes)
+
+
+def test_a_misread_bracket_overlapping_the_real_1st_ending_loses_to_it():
+    # Brackets belong to the staff under them: the real ones are above the top
+    # staff (voice, part 1); a lyric extender under the voice lands on the
+    # piano (part 2) as a bracket over bars 3-4.
+    stop1 = '<ending number="1" type="stop"/>'
+    voice = [_Q, _Q, _Q, _bl("left", _E1) + _Q + _bl("right", stop1, _BACK),
+             _bl("left", '<ending number="2" type="start"/>') + _Q
+             + _bl("right", '<ending number="2" type="discontinue"/>'), _Q]
+    piano = [_Q, _Q, _bl("left", _E1) + _Q, _Q + _bl("right", stop1, _BACK), _Q, _Q]
+    root = root_of(_parts_score([("Voice", 1, voice), ("Piano", 1, piano)]))
+    sanitize(root)
+    assert _play_order(root) == "1 2 3 4 1 2 3 5 6".split()
+    # And a real two-bar 1st ending that the piano read as one bar keeps both bars.
+    voice = [_Q, _Q, _bl("left", _E1) + _Q, _Q + _bl("right", stop1, _BACK),
+             _bl("left", '<ending number="2" type="start"/>') + _Q
+             + _bl("right", '<ending number="2" type="discontinue"/>'), _Q]
+    piano = [_Q, _Q, _Q, _bl("left", _E1) + _Q + _bl("right", stop1, _BACK), _Q, _Q]
+    root = root_of(_parts_score([("Voice", 1, voice), ("Piano", 1, piano)]))
+    sanitize(root)
+    assert _play_order(root) == "1 2 3 4 1 2 5 6".split()
+
+
+def test_an_open_bracket_before_a_plain_repeat_is_a_misread():
+    # ||: 1 2 | 3 (an open '1' read at a line start) 4 :|| 5 6: a plain repeat.
+    bars = [_bl("left", _FWD) + _Q, _Q, _bl("left", _E1) + _Q, _Q + _bl("right", _BACK), _Q, _Q]
+    root = root_of(score(bars))
+    sanitize(root)
+    assert _play_order(root) == "1 2 3 4 1 2 3 4 5 6".split()
+
+
+def test_an_open_2nd_ending_does_not_take_a_later_sections_repeat():
+    # ||: 1 |1. 2 :| 2. 3 (left open) | 4 ||: 5 6 :|| 7
+    stop1 = '<ending number="1" type="stop"/>'
+    bars = [_bl("left", _FWD) + _Q, _bl("left", _E1) + _Q + _bl("right", stop1, _BACK),
+            _bl("left", '<ending number="2" type="start"/>') + _Q, _Q,
+            _bl("left", _FWD) + _Q, _Q + _bl("right", _BACK), _Q]
+    root = root_of(score(bars))
+    sanitize(root)
+    assert _play_order(root) == "1 2 1 3 4 5 6 5 6 7".split()
+
+
+def test_a_1st_ending_read_in_two_pieces_at_a_line_break_is_one_bracket():
+    stop1 = '<ending number="1" type="stop"/>'
+    bars = [_Q, _Q, _Q, _bl("left", _E1) + _Q + _bl("right", '<ending number="1" type="discontinue"/>'),
+            _bl("left", _E1) + _Q + _bl("right", stop1, _BACK),
+            _bl("left", '<ending number="2" type="start"/>') + _Q
+            + _bl("right", '<ending number="2" type="discontinue"/>'), _Q]
+    root = root_of(score(bars))
+    sanitize(root)
+    assert _play_order(root) == "1 2 3 4 5 1 2 3 6 7".split()
+
+
+def test_multi_pass_endings_keep_their_numbers():
+    e = lambda n, t: f'<ending number="{n}" type="{t}"/>'
+    bars = [_bl("left", _FWD) + _Q, _Q,
+            _bl("left", e("1, 3", "start")) + _Q + _bl("right", e("1, 3", "stop"), '<repeat direction="backward" times="4"/>'),
+            _bl("left", e("2, 4", "start")) + _Q + _bl("right", e("2, 4", "stop"), '<repeat direction="backward" times="4"/>'),
+            _Q]
+    root = root_of(score(bars))
+    notes = sanitize(root)
+    assert [e.get("number") for m in root.iter("measure") for e in m.iter("ending")] == \
+        ["1, 3", "1, 3", "2, 4", "2, 4"]
+    assert not any("wrong number" in n for n in notes)
+
+
+def test_a_pickup_sung_alone_while_the_piano_rests_is_not_padded():
+    whole_v, whole_p = note("C", 5, 8, "whole"), (note("E", 4, 8, "whole") + backup(8)
+                                                   + note("C", 3, 8, "whole", staff="2"))
+    root = root_of(_parts_score([("Voice", 1, [note("G", 4, 2, "quarter"), whole_v, whole_v]),
+                                 ("Piano", 2, [_mrest(2) + backup(2) + _mrest(2, staff="2"),
+                                               whole_p, whole_p])], beats=4))
+    rep = mx.repair(root, _heard_from_root)
+    assert rep.padded == []
+    assert _heard_from_root(root) == [1, 4, 4]
+
+
+def test_cutting_back_takes_a_grace_note_with_its_note_and_keeps_the_other_voices():
+    grace = ('<note><grace slash="yes"/><pitch><step>F</step><octave>5</octave></pitch>'
+             '<voice>1</voice><type>eighth</type><staff>1</staff></note>')
+    over = (note("C", 5, 2, "quarter") + note("D", 5, 4, "half") + grace + note("E", 5, 2, "quarter")
+            + backup(8) + note("C", 3, 6, "half", staff="2", dot=True))
+    root = root_of(score([FULL, over, FULL]))
+    rep = mx.repair(root, _heard_from_root)
+    assert rep.trimmed == ["2"] and rep.removed == 2
+    m = root.find("part").findall("measure")[1]
+    assert [n.findtext("pitch/step") for n in m.findall("note")] == ["C", "D", "C"]
+    assert m.find("backup/duration").text == "6"
+    assert _heard_from_root(root) == [3, 3, 3]
+
+
+def test_a_bar_of_whole_bar_rests_with_the_wrong_length_gets_the_bar_length():
+    full_v = note("C", 5, 4, "half")
+    full_p = note("C", 4, 4, "half") + backup(4) + note("C", 3, 4, "half", staff="2")
+    root = root_of(_parts_score([
+        ("Voice", 1, [full_v, _mrest(3), full_v, full_v]),
+        ("Piano", 2, [full_p, _mrest(3) + backup(3) + _mrest(3, staff="2"), full_p, full_p])],
+        beats=2))
+    mx.repair(root, _heard_from_root)
+    assert _heard_from_root(root) == [2, 2, 2, 2]
+
+
+def test_tied_pieces_are_counted_so_the_ledger_still_sees_losses():
+    rh = note("C", 5, 1, "eighth") + note("D", 5, 8, "whole")
+    four = note("C", 5, 8, "whole") + backup(8) + note("C", 3, 8, "whole", staff="2")
+    root = root_of(score([four, rh + backup(9) + note("C", 3, 8, "whole", staff="2"), four], beats=4))
+    from sheet2audio import ledger
+    before = ledger.count(root)
+    rep = mx.repair(root, _heard_from_root)
+    assert (rep.removed, rep.added) == (0, 1)
+    assert ledger.count(root) - rep.added + rep.removed == before
+
+
+# ---------------------------------------------------------------- parts split by printed name
+
+
+def test_part_names_that_are_the_same_part():
+    same = [("Part II", "II"), ("Soprano Alto", "S A"), ("Soprano Alto", "SA"), ("Piano", "Pno."),
+            ("Soprano", "S."), ("Part I", "I"), ("Children", "Ch.")]
+    different = [("Part II", "I"), ("I", "II"), ("Tenor 1", "Tenor 2"), ("Tenor", "Bass"),
+                 ("Alto", "Accompaniment"), ("Oh.", "Ch.")]
+    assert all(mx._same_name(a, b) for a, b in same)
+    assert not any(mx._same_name(a, b) for a, b in different)
+
+
+def _audiveris_lines(parts: list[tuple[str, list[bool], str]], lines: int = 3, per_line: int = 2) -> bytes:
+    """Audiveris-style MusicXML: `parts` = (name, printed on each line, notes step);
+    a part not printed on a line gets whole-bar rests and print-object='no'."""
+    plist, body = "", ""
+    for k, (name, printed, step) in enumerate(parts, 1):
+        plist += f'<score-part id="P{k}"><part-name>{name}</part-name></score-part>'
+        ms = []
+        for line in range(lines):
+            for j in range(per_line):
+                i = line * per_line + j
+                head = ""
+                if j == 0:
+                    new = ' new-system="yes"' if line else ""
+                    head = (f'<print{new}><staff-layout number="1"><staff-details print-object="'
+                            f'{"yes" if printed[line] else "no"}"/></staff-layout></print>')
+                    if i == 0:
+                        head += ("<attributes><divisions>2</divisions><time><beats>3</beats>"
+                                 "<beat-type>4</beat-type></time><clef><sign>G</sign><line>2</line>"
+                                 "</clef></attributes>")
+                music = (note(step, 4, 6, "half", dot=True).replace(
+                    "</note>", "<lyric><text>la</text></lyric></note>") if printed[line] else _mrest(6))
+                ms.append(f'<measure number="{i + 1}">{head}{music}</measure>')
+        body += f'<part id="P{k}">{"".join(ms)}</part>'
+    return ('<?xml version="1.0" encoding="UTF-8"?><score-partwise version="4.0"><identification>'
+            '<encoding><software>Audiveris 5.11</software></encoding></identification>'
+            f'<part-list>{plist}</part-list>{body}</score-partwise>').encode()
+
+
+def test_a_part_printed_under_two_names_is_joined_and_the_other_part_kept():
+    # Line 1: only 'Part II'; lines 2-3: 'I' and 'II' (the same voice as 'Part II').
+    xml = _audiveris_lines([("I", [False, True, True], "E"), ("II", [False, True, True], "C"),
+                            ("Part II", [True, False, False], "C")])
+    root = root_of(xml)
+    from sheet2audio import ledger
+    before = ledger.count(root)
+    notes = sanitize(root)
+    assert [sp.findtext("part-name") for sp in root.iter("score-part")] == ["I", "Part II"]
+    p2 = root.findall("part")[1]
+    assert all(m.find("note/pitch/step") is not None for m in p2.findall("measure"))
+    assert ledger.count(root) == before
+    assert any("printed under two names" in n for n in notes)
+    from sheet2audio.render import describe_parts
+    mx.untag(root)
+    assert [d[0] for d in describe_parts(mx.to_bytes(root))] == ["Part I", "Part II"]
+
+
+def test_parts_printed_on_the_same_line_are_not_joined():
+    xml = _audiveris_lines([("Part II", [True, True, False], "C"), ("II", [False, True, True], "C")])
+    root = root_of(xml)
+    sanitize(root)
+    assert len(root.findall("part")) == 2
+
+
+# ---------------------------------------------------------------- re-timing by note positions
+
+
+def _xnote(step, octave, dur, typ, x, voice="1", staff="1"):
+    return note(step, octave, dur, typ, voice=voice, staff=staff).replace("<note>", f'<note default-x="{x}">', 1)
+
+
+def _retime_score(voice_bar: str, with_x=True) -> bytes:
+    """3/4, divisions 2. Voice + piano right hand; the piano plays
+    A quarter (x 90), rest... no: A dotted quarter, D eighth (x 213), G F eighths (x 252, 291)."""
+    piano = (_xnote("A", 4, 3, "quarter", 90).replace("<type>quarter</type>", "<type>quarter</type><dot/>")
+             + _xnote("D", 4, 1, "eighth", 213) + _xnote("G", 4, 1, "eighth", 252)
+             + _xnote("F", 4, 1, "eighth", 291))
+    full_v, full_p = note("C", 5, 6, "half", dot=True), note("C", 4, 6, "half", dot=True)
+    if not with_x:
+        voice_bar = re.sub(r' default-x="[^"]*"', "", voice_bar)
+    return _parts_score([("Voice", 1, [full_v, voice_bar, full_v]),
+                         ("Piano", 1, [full_p, piano, full_p])])
+
+
+def test_notes_read_early_after_a_missed_rest_are_moved_to_line_up():
+    # Printed: A quarter, eighth rest, D eighth, G F eighths. The rest was not read.
+    voice = (_xnote("A", 4, 2, "quarter", 90) + _xnote("D", 4, 1, "eighth", 213)
+             + _xnote("G", 4, 1, "eighth", 252) + _xnote("F", 4, 1, "eighth", 291))
+    root = root_of(_retime_score(voice))
+    rep = mx.repair(root, _heard_from_root)
+    m = root.find("part").findall("measure")[1]
+    got = [("r" if n.find("rest") is not None else n.findtext("pitch/step"), n.findtext("duration"))
+           for n in m.findall("note")]
+    assert got == [("A", "2"), ("r", "1"), ("D", "1"), ("G", "1"), ("F", "1")]
+    assert any("1 beat" not in n and "0.5 beat early" in n for n in rep.notes)
+    assert mx.staff_gaps(root) == []
+
+
+def test_no_positions_or_no_agreement_means_no_re_timing():
+    voice = (_xnote("A", 4, 2, "quarter", 90) + _xnote("D", 4, 1, "eighth", 213)
+             + _xnote("G", 4, 1, "eighth", 252) + _xnote("F", 4, 1, "eighth", 291))
+    root = root_of(_retime_score(voice, with_x=False))
+    mx.repair(root, _heard_from_root)
+    assert root.find("part").findall("measure")[1].find("note/rest") is None
+    # The later notes do not agree on how early they are: leave the bar alone.
+    voice = (_xnote("A", 4, 2, "quarter", 90) + _xnote("D", 4, 1, "eighth", 213)
+             + _xnote("G", 4, 1, "eighth", 291) + _xnote("F", 4, 1, "eighth", 400))
+    root = root_of(_retime_score(voice))
+    mx.repair(root, _heard_from_root)
+    assert root.find("part").findall("measure")[1].find("note/rest") is None
+
+
+def test_padding_a_bar_where_the_piano_rests_throughout_keeps_the_piano_in_step():
+    # 2/4: the voice lost a trailing eighth rest; the piano rests on both staves
+    # (whole-bar rests of the misread length, with a backup between them).
+    full_v = note("C", 5, 4, "half")
+    full_p = note("C", 4, 4, "half") + backup(4) + note("C", 3, 4, "half", staff="2")
+    short_v = note("C", 5, 2, "quarter") + note("D", 5, 1, "eighth")
+    violin = note("E", 5, 2, "quarter") + note("F", 5, 1, "eighth")
+    root = root_of(_parts_score([
+        ("Voice", 1, [full_v, short_v, full_v, full_v]),
+        ("Violin", 1, [full_v, violin, full_v, full_v]),
+        ("Piano", 2, [full_p, _mrest(3) + backup(3) + _mrest(3, staff="2"), full_p, full_p])],
+        beats=2))
+    rep = mx.repair(root, _heard_from_root)
+    assert rep.padded == ["2"] and _heard_from_root(root) == [2, 2, 2, 2]
+    piano = root.findall("part")[2].findall("measure")[1]
+    assert [c.findtext("duration") for c in piano if c.tag in ("note", "backup")] == ["4", "4", "4"]
+
+
+def test_cutting_back_closes_the_beam_and_drops_ties_into_removed_notes():
+    def bn(step, dur, typ, beam=None, tie=None):
+        t = f'<tie type="{tie}"/>' if tie else ""
+        b = f'<beam number="1">{beam}</beam>' if beam else ""
+        n = (f"<note><pitch><step>{step}</step><octave>5</octave></pitch><duration>{dur}</duration>{t}"
+             f"<voice>1</voice><type>{typ}</type><staff>1</staff>{b}")
+        if tie:
+            n += f'<notations><tied type="{tie}"/></notations>'
+        return n + "</note>"
+    rh = (note("C", 5, 4, "half") + bn("D", 1, "eighth", "begin") + bn("E", 1, "eighth", "continue", "start")
+          + bn("E", 1, "eighth", "continue", "stop") + bn("G", 1, "eighth", "end"))
+    root = root_of(score([FULL, rh + backup(8) + note("C", 3, 6, "half", staff="2", voice="2", dot=True),
+                          FULL]))
+    rep = mx.repair(root, _heard_from_root)
+    assert rep.trimmed == ["2"] and rep.removed == 2
+    kept = [n for n in root.find("part").findall("measure")[1].findall("note") if n.findtext("staff") == "1"]
+    assert [b.text for b in kept[-1].findall("beam")] == ["end"]
+    assert kept[-1].find("tie") is None and kept[-1].find("notations/tied") is None
+
+
+def test_the_missing_rest_goes_after_the_last_note_confirmed_in_place():
+    # Printed: D quarter, eighth rest, D eighth, G F eighths. The D eighth lines up with
+    # nothing in the other staff, so only the G and F show the bar is late from there.
+    voice = (_xnote("D", 5, 2, "quarter", 90) + _xnote("D", 4, 1, "eighth", 190)
+             + _xnote("G", 4, 1, "eighth", 252) + _xnote("F", 4, 1, "eighth", 291))
+    root = root_of(_retime_score(voice))
+    mx.repair(root, _heard_from_root)
+    m = root.find("part").findall("measure")[1]
+    got = ["r" if n.find("rest") is not None else n.findtext("pitch/step") for n in m.findall("note")]
+    assert got == ["D", "r", "D", "G", "F"]
+
+
+def test_joining_parts_never_swaps_a_bar_for_an_empty_one():
+    # OMR read nothing in bar 2 (its notes were missed): the part printed on that
+    # line has an empty bar, the other part a whole-bar rest, which alone gives
+    # the bar its length. The joined part must keep the rest.
+    xml = _audiveris_lines([("Soprano Alto", [True, False, False], "C"),
+                            ("S A", [False, True, True], "C")])
+    root = root_of(xml)
+    sa = root.findall("part")[1].findall("measure")
+    for c in list(sa[2]):
+        if c.tag == "note":
+            sa[2].remove(c)
+    first = root.findall("part")[0].findall("measure")
+    for c in list(first[2]):
+        if c.tag == "note":
+            first[2].remove(c)
+    first[2].append(ET.fromstring(_mrest(6)))
+    sanitize(root)
+    assert len(root.findall("part")) == 1
+    assert root.find("part").findall("measure")[2].find("note/rest") is not None

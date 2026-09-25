@@ -199,10 +199,12 @@ def sanitize(root: ET.Element, source_name: str | None = None) -> list[Note]:
     if audiveris:
         _renumber_lyrics(root)
     _order_ties(root)
+    if audiveris:
+        notes += _merge_split_parts(root)
     _off_drum_channel(root)
     _normalize_repeat_barlines(root)
     _share_repeats(root)
-    notes += _drop_orphan_endings(root)
+    notes += _fix_endings(root)
     notes += _drop_empty_measures(root)  # before the repeat fix: it moves barlines
     notes += _align_part_barlines(root)
     notes += _fix_part_mapping(root)
@@ -658,6 +660,179 @@ def _normalize_repeat_barlines(root: ET.Element) -> None:
         bs.text = want
 
 
+_NAME_FILLER = {"part", "voice", "voices", "choir", "chorus", "staff", "the"}
+
+
+def _name_tokens(label: str) -> list[str]:
+    words = re.sub(r"[^\w\s]", " ", (label or "").lower()).split()
+    return [w for w in words if w not in _NAME_FILLER]
+
+
+def _same_name(a: str, b: str) -> bool:
+    """'Part II' ~ 'II', 'Soprano Alto' ~ 'S A' ~ 'SA', 'Piano' ~ 'Pno.',
+    'Soprano' ~ 'S.'; but never 'I' ~ 'II' or 'Tenor 1' ~ 'Tenor 2'."""
+    ta, tb = _name_tokens(a), _name_tokens(b)
+    if not ta or not tb:
+        return False
+    if ta == tb or "".join(ta) == "".join(tb):
+        return True
+
+    def numeral(w: str) -> bool:
+        return bool(re.fullmatch(r"[ivxlc]+|\d+", w))
+
+    if any(numeral(w) for w in ta + tb):
+        return False  # numbered parts must match exactly (checked above)
+    for many, few in ((ta, tb), (tb, ta)):
+        if len(many) >= 2 and "".join(w[0] for w in many) == "".join(few):
+            return True  # initials
+
+    def shortened(short: str, long: str) -> bool:  # 'pno' from 'piano', 's' from 'soprano'
+        if len(short) >= len(long) or short[:1] != long[:1]:
+            return False
+        if len(short) == 1:
+            return len(long) >= 4 and long.isalpha()
+        it = iter(long)
+        return all(ch in it for ch in short)
+
+    return len(ta) == len(tb) and all(x == y or shortened(x, y) or shortened(y, x)
+                                      for x, y in zip(ta, tb))
+
+
+def _printed_lines(part: ET.Element, starts: list[int]) -> set[int]:
+    """The lines of music (by their first bar) on which a part is printed:
+    Audiveris writes <staff-details print-object="no"> at the start of a
+    line for a part it did not find on it."""
+    ms = part.findall("measure")
+    out = set()
+    for i in starts:
+        if i >= len(ms):
+            continue
+        details = list(ms[i].iter("staff-details"))
+        if not details or any(d.get("print-object", "yes") != "no" for d in details):
+            out.add(i)
+    return out
+
+
+def _clef_at(part: ET.Element, index: int) -> str | None:
+    sign = None
+    for m in part.findall("measure")[: index + 1]:
+        for c in m.iter("clef"):
+            if c.get("number", "1") == "1":
+                sign = (c.findtext("sign") or "") + (c.findtext("clef-octave-change") or "")
+    return sign
+
+
+def _set_divisions(part: ET.Element, target: int) -> bool:
+    """Rewrite a part in `target` divisions per quarter note."""
+    div = None
+    for m in part.findall("measure"):
+        for a in m.findall("attributes"):
+            d = a.find("divisions")
+            if d is not None and (d.text or "").strip().isdigit():
+                div = int(d.text)
+                d.text = str(target)
+        if not div or target % div:
+            return False
+        _scale_durations(m, target // div)
+    return True
+
+
+def _merge_split_parts(root: ET.Element) -> list[Note]:
+    """Audiveris makes a new part whenever the printed name changes: a
+    choir part labelled 'Part II' on the first line and 'II' after it, or
+    'Soprano Alto' then 'S A', becomes two parts, each silent where the
+    other sings. That splits the rehearsal track, the part names and the
+    repeats. Merge two parts that are never printed on the same line and
+    have the same number of staves, the same clef and matching names."""
+    notes: list[Note] = []
+    parts = _parts(root)
+    if len(parts) < 2:
+        return notes
+    first = parts[0].findall("measure")
+    starts = [i for i, m in enumerate(first) if i == 0 or any(
+        pr.get("new-system") == "yes" or pr.get("new-page") == "yes" for pr in m.findall("print"))]
+    names = {sp.get("id"): (sp.findtext("part-name") or "").strip() for sp in root.iter("score-part")}
+
+    def staves(p):
+        return max((_int(a.find("staves"), 1) for a in p.iter("attributes")), default=1)
+
+    merged = True
+    while merged:
+        merged = False
+        parts = _parts(root)
+        lines = {p.get("id"): _printed_lines(p, starts) for p in parts}
+        for a in parts:
+            for b in parts:
+                la, lb = lines[a.get("id")], lines[b.get("id")]
+                if a is b or not la or not lb or la & lb or min(la) > min(lb):
+                    continue
+                if staves(a) != staves(b) or len(a.findall("measure")) != len(b.findall("measure")):
+                    continue
+                if not _same_name(names.get(a.get("id"), ""), names.get(b.get("id"), "")):
+                    continue
+                if _clef_at(a, min(la)) != _clef_at(b, min(lb)):
+                    continue
+                if not _move_lines(root, a, b, sorted(lb), starts):
+                    continue
+                name_a, name_b = names[a.get("id")], names[b.get("id")]
+                longer = max(name_a, name_b, key=len)
+                sp = root.find(f".//score-part[@id='{a.get('id')}']")
+                if sp is not None and sp.find("part-name") is not None:
+                    sp.find("part-name").text = longer
+                names[a.get("id")] = longer
+                said = (f"'{name_a}' was read as two parts" if name_a == name_b else
+                        f"'{name_a}' and '{name_b}' are the same part, printed under two names")
+                notes.append(Note(f"Measure {{m}}: {said}; joined them.",
+                                  _ref(first[min(lb)]) if min(lb) < len(first) else None))
+                merged = True
+                break
+            if merged:
+                break
+    return notes
+
+
+def _move_lines(root: ET.Element, a: ET.Element, b: ET.Element, lines: list[int],
+                starts: list[int]) -> bool:
+    """Move the bars of part b on the given lines into part a (where a is
+    not printed), then drop part b."""
+    import math
+    divs = [int(d.text) for p in (a, b) for d in p.iter("divisions")
+            if (d.text or "").strip().isdigit()]
+    target = math.lcm(*divs) if divs else 1
+    trial_a, trial_b = copy.deepcopy(a), copy.deepcopy(b)
+    if not (_set_divisions(trial_a, target) and _set_divisions(trial_b, target)):
+        return False
+    ma, mb = trial_a.findall("measure"), trial_b.findall("measure")
+    bounds = starts + [len(ma)]
+    bars = [i for line in lines for i in range(line, next(x for x in bounds if x > line))]
+    # An empty bar of a keeps what b has there (a whole-bar rest can be all
+    # that gives a bar its length when OMR read nothing in it).
+    bars += [i for i in range(len(ma)) if i not in bars and ma[i].find("note") is None
+             and mb[i].find("note") is not None]
+    for i in sorted(bars):
+        if mb[i].find("note") is None and ma[i].find("note") is not None:
+            continue  # never swap a bar for an empty one
+        keep = [c for c in ma[i] if c.tag == "attributes"]  # a's clef/key/time/staves
+        new = [copy.deepcopy(c) for c in mb[i]]
+        ma[i].clear()
+        ma[i].attrib.update(mb[i].attrib)
+        for c in new:
+            ma[i].append(c)
+        if keep and ma[i].find("attributes") is None:
+            _insert_after_header(ma[i], keep[0])
+    # replace a with the trial, drop b
+    a.clear()
+    a.attrib.update(trial_a.attrib)
+    a.extend(list(trial_a))
+    root.remove(b)
+    part_list = root.find("part-list")
+    if part_list is not None:
+        for sp in part_list.findall("score-part"):
+            if sp.get("id") == b.get("id"):
+                part_list.remove(sp)
+    return True
+
+
 def _off_drum_channel(root: ET.Element) -> None:
     """Audiveris numbers MIDI channels by part, so a 10th part gets channel
     10, which General MIDI reserves for drums: its notes turn into drum
@@ -718,57 +893,209 @@ def _share_repeats(root: ET.Element) -> None:
                 bl.append(copy.deepcopy(rep))
 
 
-def _drop_orphan_endings(root: ET.Element) -> list[Note]:
-    """A 1st-ending bracket means something only when it closes with an
-    end-repeat (and a 2nd ending only right after such a 1st ending).
-    Without one, players take the bracket as 'skip this the first time' and
-    its bars are never played; OMR reads slurs and lines as brackets. Drop
-    those brackets (from each part where they are orphaned)."""
-    notes = []
+def _ending_spans(part: ET.Element) -> list[tuple[int, int, str, bool]]:
+    """(first bar, last bar, number, closed) for each ending bracket of a part.
+    A bracket that is never closed runs to the next bracket of its number,
+    or to the end."""
+    ms = part.findall("measure")
+    spans, open_ = [], {}
+    for i, m in enumerate(ms):
+        for bl in m.findall("barline"):
+            for e in bl.findall("ending"):
+                num = (e.get("number") or "").strip()
+                if e.get("type") == "start":
+                    if num in open_:
+                        spans.append((open_.pop(num), i - 1, num, False))
+                    open_[num] = i
+                elif num in open_:
+                    spans.append((open_.pop(num), i, num, True))
+                else:
+                    spans.append((i, i, num, True))
+    spans += [(j, len(ms) - 1, num, False) for num, j in open_.items()]
+    return spans
+
+
+def _numbers(text: str) -> list[int]:
+    return [int(x) for x in re.findall(r"\d+", text)]
+
+
+def _fix_endings(root: ET.Element) -> list[Note]:
+    """Make the 1st/2nd-ending brackets consistent, the same in every part.
+
+    OMR gets them wrong in several ways: it reads lyric extenders and lines
+    as brackets (often left open: their end is never read), writes number 1
+    when it cannot read the number, misses a bracket, reads one bracket as
+    two pieces at a line break, and puts a bracket only into the parts that
+    have a staff under it. Players follow the brackets of the first part: a
+    bracket nobody repeats into makes its bars silent, and a 1st ending with
+    no 2nd ending makes them skip the repeat.
+
+    So:
+    - an open bracket covers at most two bars, and never crosses a start-
+      repeat, the end of a section or the next bracket;
+    - a bracket ending in an end-repeat is a 1st ending if it was closed or
+      another bracket follows it; of overlapping ones, the one read in most
+      parts wins, then the one in the topmost part (brackets are printed
+      above the top staff), then the shorter;
+    - each 1st ending is followed by the bracket that starts right after it
+      (its number never one already used), or, when a closed 1st ending has
+      none, by an assumed one-bar 2nd ending (unless a new section or
+      bracket starts there; with no bar after it, the 1st bracket is dropped
+      so that the repeat is at least played);
+    - other brackets are dropped, and the result goes into every part."""
+    notes: list[Note] = []
     parts = _parts(root)
     if not parts:
         return notes
-    n = max(len(p.findall("measure")) for p in parts)
-    back = [any(i < len(p.findall("measure")) and _repeat(p.findall("measure")[i], "right", "backward")
-                for p in parts) for i in range(n)]
+    measures = [p.findall("measure") for p in parts]
+    n = max(len(ms) for ms in measures)
+
+    def anywhere(test) -> list[bool]:
+        return [any(i < len(ms) and test(ms[i]) for ms in measures) for i in range(n)]
+
+    back = anywhere(lambda m: _repeat(m, "right", "backward"))
+    fwd = anywhere(lambda m: _repeat(m, "left", "forward"))
+    section_end = anywhere(lambda m: _bar_style(m, "right") in ("light-heavy", "heavy-heavy")
+                           and not _repeat(m, "right", "backward"))
+    found = []  # (part index, first bar, last bar, number, closed)
     for pi, part in enumerate(parts):
-        ms = part.findall("measure")
-        spans = []  # (start index, stop index, number, [ending elements])
-        open_: dict[str, tuple[int, list[ET.Element]]] = {}
-        for i, m in enumerate(ms):
+        joined: list[tuple[int, int, str, bool]] = []
+        for span in sorted(_ending_spans(part)):
+            if joined:  # one bracket read as two pieces at a line break
+                a0, a1, anum, _ = joined[-1]
+                if (a1 + 1 == span[0] and not any(back[k] for k in range(a0, a1 + 1))
+                        and any(back[k] for k in range(span[0], min(span[1], n - 1) + 1))
+                        and _numbers(anum) in ([1], []) and _numbers(span[2]) in ([1], [])):
+                    joined[-1] = (a0, span[1], anum or span[2], span[3])
+                    continue
+            joined.append(span)
+        found += [(pi,) + span for span in joined]
+    if not found:
+        return notes
+    starts = sorted({f[1] for f in found})
+    spans: dict[tuple[int, int], dict] = {}
+    for pi, start, stop, num, closed in found:
+        if not closed:
+            limits = [start + 1, n - 1] + [s2 - 1 for s2 in starts if s2 > start]
+            limits += [k - 1 for k in range(start + 1, min(start + 2, n)) if fwd[k]]
+            stop = min(limits)
+            end = next((k for k in range(start, stop + 1) if section_end[k]), None)
+            if end is not None:
+                stop = end
+        repeat_at = next((k for k in range(start, min(stop, n - 1) + 1) if back[k]), None)
+        if repeat_at is not None:
+            stop = repeat_at
+        elif not closed:
+            stop = start  # its end was not read; one bar is enough to play it right
+        info = spans.setdefault((start, stop), {"nums": [], "parts": set(), "closed": False,
+                                                "repeat": repeat_at is not None})
+        info["nums"].append(num)
+        info["parts"].add(pi)
+        info["closed"] = info["closed"] or closed
+    followed = {k: any(k2[0] == k[1] + 1 for k2 in spans) for k in spans}
+
+    def rank(key):
+        info = spans[key]
+        return (-len(info["parts"]), min(info["parts"]), key[1] - key[0], -key[0])
+
+    def free(key, taken):
+        return not any(key[0] <= b and a <= key[1] for a, b in taken)
+
+    taken: list[tuple[int, int]] = []
+    firsts = []
+    for key in sorted((k for k in spans if spans[k]["repeat"]
+                       and (spans[k]["closed"] or followed[k])), key=rank):
+        if free(key, taken):
+            taken.append(key)
+            firsts.append(key)
+    chains = []
+    in_chain: set[tuple[int, int]] = set()
+    for key in sorted(firsts):
+        if key in in_chain:
+            continue  # already followed from an earlier bracket
+        written = max(spans[key]["nums"], key=spans[key]["nums"].count)
+        nums = _numbers(written)
+        label = written if len(nums) > 1 and min(nums) == 1 else "1"
+        used = set(_numbers(label))
+        chain = [(key[0], key[1], label, True)]
+        in_chain.add(key)
+        cur = key
+        while True:
+            after = sorted((k for k in spans if k[0] == cur[1] + 1
+                            and (k in firsts or free(k, taken))),
+                           key=lambda k: (not spans[k]["repeat"], rank(k)))
+            if not after:
+                nxt_bar = cur[1] + 1
+                # A lone 1st ending is trusted (and its 2nd assumed) only when it
+                # was read in two parts or in the topmost part playing there.
+                playing = [pi for pi, ms in enumerate(measures) if key[0] < len(ms)
+                           and set(_Timing(ms[key[0]]).staff_end) - _rest_only_staves(ms[key[0]])]
+                trusted = len(spans[key]["parts"]) >= 2 or (
+                    bool(playing) and min(spans[key]["parts"]) <= min(playing))
+                if len(chain) == 1 and not trusted:
+                    chain = []  # a misread: without it the repeat is at least played
+                elif len(chain) == 1 and spans[key]["closed"]:
+                    if nxt_bar < n and not fwd[nxt_bar] and nxt_bar not in starts:
+                        label2 = str(next(x for x in range(1, 100) if x not in used))
+                        chain.append((nxt_bar, nxt_bar, label2, False))
+                        taken.append((nxt_bar, nxt_bar))
+                        if nxt_bar < len(measures[0]):
+                            notes.append(Note(
+                                f"Measure {{m}}: no bracket was read for the ending after the "
+                                f"repeat; assumed ending {label2} starts here.",
+                                _ref(measures[0][nxt_bar])))
+                    elif nxt_bar >= n:
+                        chain = []  # nothing after it: better to play the repeat
+                break
+            k = after[0]
+            if k not in taken:
+                taken.append(k)
+            in_chain.add(k)
+            written = max(spans[k]["nums"], key=spans[k]["nums"].count)
+            nums = _numbers(written)
+            if nums and not set(nums) & used and (len(nums) > 1 or nums[0] != 1):
+                label = written
+            else:
+                label = str(next(x for x in range(1, 100) if x not in used))
+                if label not in spans[k]["nums"] and k[0] < len(measures[0]):
+                    notes.append(Note(f"Measure {{m}}: this ending bracket was read with the wrong "
+                                      f"number; it is ending {label}.", _ref(measures[0][k[0]])))
+            used.update(_numbers(label))
+            chain.append((k[0], k[1], label, spans[k]["repeat"]))
+            if not spans[k]["repeat"]:
+                break
+            cur = k
+        if chain:
+            chains.append(chain)
+    final = [c for chain in chains for c in chain]
+    kept = {(a, b) for a, b, _, _ in final}
+    for key in sorted(spans):
+        if key not in kept and key[0] < len(measures[0]):
+            notes.append(Note("Measure {m}: removed a 1st/2nd-ending bracket that does not go "
+                              "with a repeat (probably a line or a lyric extender misread).",
+                              _ref(measures[0][key[0]])))
+    for ms in measures:
+        for m in ms:
             for bl in m.findall("barline"):
                 for e in bl.findall("ending"):
-                    num = (e.get("number") or "").strip()
-                    if e.get("type") == "start":
-                        if num in open_:  # never closed: an orphan too
-                            j, els = open_.pop(num)
-                            spans.append((j, i - 1, num, els))
-                        open_[num] = (i, [e])
-                    elif num in open_:
-                        j, els = open_.pop(num)
-                        spans.append((j, i, num, els + [e]))
-                    else:
-                        spans.append((i, i, num, [e]))
-        for num, (j, els) in open_.items():
-            spans.append((j, len(ms) - 1, num, els))
-        spans.sort()
-        valid_first_end = -2
-        for start, stop, num, els in spans:
-            first = "1" in re.split(r"[,\s]+", num)
-            closes = next((k for k in range(start, stop + 1) if back[k]), None)
-            ok = (first and closes is not None) or (not first and start == valid_first_end + 1)
-            if first and closes is not None:
-                valid_first_end = closes
-            if ok:
+                    bl.remove(e)
+        for start, stop, label, repeated in final:
+            if stop >= len(ms):
                 continue
-            for e in els:
-                for bl in part.iter("barline"):
-                    if e in list(bl):
-                        bl.remove(e)
-            if pi == 0:
-                notes.append(Note("Measure {m}: removed a 1st/2nd-ending bracket that has no repeat "
-                                  "(probably a line or slur misread); the bars under it would never "
-                                  "have been played.", _ref(ms[start])))
+            for i, location, kind in ((start, "left", "start"),
+                                      (stop, "right", "stop" if repeated else "discontinue")):
+                m = ms[i]
+                bl = next((x for x in m.findall("barline")
+                           if x.get("location", "right") == location), None)
+                if bl is None:
+                    bl = ET.Element("barline", {"location": location})
+                    if location == "left":
+                        _insert_after_header(m, bl)
+                    else:
+                        m.append(bl)
+                e = ET.Element("ending", {"number": label, "type": kind})
+                rep = bl.find("repeat")
+                bl.insert(list(bl).index(rep) if rep is not None else len(bl), e)
     return notes
 
 
@@ -1326,6 +1653,9 @@ class RepairReport:
     padded: list[str] = field(default_factory=list)
     unfixed: list[str] = field(default_factory=list)
     overfull: list[str] = field(default_factory=list)
+    trimmed: list[str] = field(default_factory=list)  # overfull bars cut back to the bar line
+    removed: int = 0  # pitched notes removed while trimming (told to the user; see ledger)
+    added: int = 0  # pitched notes added by splitting one into tied values (see ledger)
     measures: int = 0
 
 
@@ -1376,7 +1706,7 @@ class _Timing:
         last_start = 0
         for idx, child in enumerate(measure):
             if child.tag == "note":
-                if child.find("grace") is not None or child.find("cue") is not None:
+                if child.find("grace") is not None:  # cue notes take time, grace notes do not
                     continue
                 dur = _int(child.find("duration"))
                 chord = child.find("chord") is not None
@@ -1395,6 +1725,320 @@ class _Timing:
                 self.pos -= _int(child.find("duration"))
             elif child.tag == "forward":
                 self.pos += _int(child.find("duration"))
+
+
+def _is_measure_rest(note: ET.Element) -> bool:
+    rest = note.find("rest")
+    return rest is not None and rest.get("measure") == "yes"
+
+
+def _rest_only_staves(measure: ET.Element) -> set[str]:
+    """Staves holding nothing but a whole-bar rest. Audiveris writes one for
+    every staff that is hidden or silent on a line, with the length of the
+    bar as it read it (too long or too short when the bar is misread);
+    Verovio gives it the bar's length, so it must not count as music."""
+    kinds: dict[str, bool] = {}  # staff -> has anything but a whole-bar rest
+    for n in measure.findall("note"):
+        staff = (n.findtext("staff") or "1").strip()
+        kinds[staff] = kinds.get(staff, False) or not _is_measure_rest(n)
+    return {s for s, other in kinds.items() if not other}
+
+
+def _set_measure_rests(measure: ET.Element, length: int) -> None:
+    """Give every whole-bar rest `length` divisions, lengthening the
+    <backup> after it by as much so the staves after it keep their times."""
+    pending = 0
+    for c in measure:
+        if c.tag == "note" and _is_measure_rest(c):
+            d = c.find("duration")
+            pending += length - _int(d)
+            d.text = str(length)
+        elif c.tag == "backup" and pending:
+            d = c.find("duration")
+            d.text = str(max(0, _int(d) + pending))
+            pending = 0
+
+
+def _music_ends(measure: ET.Element) -> dict[str, int]:
+    """Where each staff with music (not just a whole-bar rest) ends, in divisions."""
+    rest_only = _rest_only_staves(measure)
+    return {s: e for s, e in _Timing(measure).staff_end.items() if s not in rest_only}
+
+
+def _set_value(note: ET.Element, duration: int, type_name: str, dotted: bool) -> None:
+    note.find("duration").text = str(duration)
+    t = note.find("type")
+    if t is None:
+        t = ET.SubElement(note, "type")
+    t.text = type_name
+    for d in note.findall("dot"):
+        note.remove(d)
+    if dotted:
+        note.insert(list(note).index(t) + 1, ET.Element("dot"))
+
+
+def _shorten(measure: ET.Element, group: list[ET.Element], length: int,
+             divisions: int) -> int | None:
+    """Give a note (with its chord members) `length` divisions, as one
+    written value or as tied values. Returns the pitched notes added (tied
+    pieces), or None if it cannot be done."""
+    if any(n.find("time-modification") is not None for n in group):
+        return None  # a tuplet: its written value is not its length
+    pieces = _decompose(Fraction(length, divisions))
+    durs = [ql * divisions for ql, _, _ in pieces]
+    if not pieces or any(d.denominator != 1 for d in durs):
+        return None
+    if len(pieces) > 1 and any(n.find("tie") is not None for n in group):
+        return None
+    at = list(measure).index(group[-1]) + 1
+    pristine = [copy.deepcopy(n) for n in group]
+    for k, ((_, name, dotted), d) in enumerate(zip(pieces, durs)):
+        if k == 0:
+            targets = group
+        else:
+            targets = [copy.deepcopy(n) for n in pristine]
+            for t in targets:  # a continuation carries only its tie
+                for tag in ("lyric", "beam", "notations"):
+                    for el in t.findall(tag):
+                        t.remove(el)
+            for t in targets:
+                measure.insert(at, t)
+                at += 1
+        for t in targets:
+            _set_value(t, int(d), name, dotted)
+            if t.find("rest") is not None or len(pieces) == 1:
+                continue
+            kinds = (["start"] if k == 0 else ["stop"] if k == len(pieces) - 1 else ["stop", "start"])
+            for kind in kinds:
+                tie = ET.Element("tie", {"type": kind})
+                t.insert(list(t).index(t.find("duration")) + 1, tie)
+                notations = t.find("notations")
+                if notations is None:
+                    notations = ET.SubElement(t, "notations")
+                ET.SubElement(notations, "tied", {"type": kind})
+    pitched = sum(1 for n in group if n.find("rest") is None and n.find("unpitched") is None)
+    return pitched * (len(pieces) - 1)
+
+
+def _clamp(measure: ET.Element, limit: int, divisions: int) -> tuple[bool, int, int]:
+    """Cut every voice of `measure` off at `limit` divisions: a note that
+    crosses it is shortened, notes that start after it are removed, and
+    the next <backup> is shortened to match, so the other voices keep their
+    times. Returns (done, pitched notes removed, pitched notes added by
+    splitting one into tied values); on failure the measure may be half
+    edited, so the caller restores it."""
+    children = list(measure)
+    pos = shift = removed = added = 0
+    removed_els: list[ET.Element] = []
+    i = 0
+    while i < len(children):
+        c = children[i]
+        if c.tag == "note" and c.find("grace") is None and c.find("chord") is None:
+            group = [c]
+            while i + len(group) < len(children) and children[i + len(group)].tag == "note" \
+                    and children[i + len(group)].find("chord") is not None:
+                group.append(children[i + len(group)])
+            dur = _int(c.find("duration"))
+            step = len(group)  # the elements this note takes up from here on
+            start, end = pos, pos + dur
+            if _is_measure_rest(c) and end > limit:
+                c.find("duration").text = str(limit)  # takes the bar's length anyway
+                shift += end - limit
+            elif start >= limit and dur:
+                k = i - 1  # grace notes just before it go with it (directions may sit between)
+                while k >= 0 and (children[k].tag == "direction" or (
+                        children[k].tag == "note" and children[k].find("grace") is not None)):
+                    if children[k].tag == "note":
+                        group.insert(0, children[k])
+                    k -= 1
+                for g in group:
+                    removed += g.find("rest") is None and g.find("unpitched") is None
+                    if g in list(measure):
+                        measure.remove(g)
+                        removed_els.append(g)
+                shift += dur
+            elif end > limit:
+                more = _shorten(measure, group, limit - start, divisions)
+                if more is None:
+                    return False, removed, added
+                added += more
+                shift += end - limit
+            pos += dur
+            i += step
+            continue
+        if c.tag == "backup":
+            d = _int(c.find("duration"))
+            if shift:
+                if d - shift < 0:
+                    return False, removed, added
+                if d - shift == 0:
+                    measure.remove(c)
+                else:
+                    c.find("duration").text = str(d - shift)
+            pos -= d
+            shift = 0
+        elif c.tag == "forward":
+            d = _int(c.find("duration"))
+            if pos >= limit:
+                measure.remove(c)
+                shift += d
+            elif pos + d > limit:
+                c.find("duration").text = str(limit - pos)
+                shift += pos + d - limit
+            pos += d
+        i += 1
+    if removed_els:
+        _close_after_cut(measure, removed_els)
+    return True, removed, added
+
+
+def _close_after_cut(measure: ET.Element, removed: list[ET.Element]) -> None:
+    """After notes are cut from the end of a voice: a beam that ran on into
+    them ends on the last note kept, and ties and slurs into them go."""
+    stopped_slurs = {(n.findtext("voice"), s.get("number", "1"))
+                     for n in removed for s in n.iter("slur") if s.get("type") == "stop"}
+    tied_to = {(n.findtext("voice"), n.findtext("staff"), n.findtext("pitch/step"),
+                n.findtext("pitch/octave")) for n in removed
+               if any(t.get("type") == "stop" for t in n.findall("tie"))}
+    cut_voices = {((n.findtext("staff") or "1"), (n.findtext("voice") or "1")) for n in removed}
+    last_by_voice: dict[tuple[str, str], ET.Element] = {}
+    for n in measure.findall("note"):
+        key = ((n.findtext("staff") or "1"), (n.findtext("voice") or "1"))
+        if n.find("chord") is None and n.find("grace") is None and key in cut_voices:
+            last_by_voice[key] = n
+    for n in measure.findall("note"):
+        voice = n.findtext("voice")
+        for notations in n.findall("notations"):
+            for sl in [x for x in notations.findall("slur")
+                       if x.get("type") == "start" and (voice, x.get("number", "1")) in stopped_slurs]:
+                notations.remove(sl)
+        key = (voice, n.findtext("staff"), n.findtext("pitch/step"), n.findtext("pitch/octave"))
+        if key in tied_to:
+            for t in [t for t in n.findall("tie") if t.get("type") == "start"]:
+                n.remove(t)
+            for notations in n.findall("notations"):
+                for t in [t for t in notations.findall("tied") if t.get("type") == "start"]:
+                    notations.remove(t)
+    for last in last_by_voice.values():
+        for b in last.findall("beam"):
+            if (b.text or "").strip() == "continue":
+                b.text = "end"
+            elif (b.text or "").strip() == "begin":
+                last.remove(b)
+
+
+_ALIGN_TOL = 4.0  # tenths: notes this close in x sound together
+
+
+def _voice_events(measure: ET.Element) -> dict[tuple[str, str], list[tuple]]:
+    """(staff, voice) -> [(note, onset, duration, x, is rest)] in divisions,
+    for each note that starts a chord (grace notes left out)."""
+    out: dict[tuple[str, str], list[tuple]] = {}
+    pos = 0
+    for c in measure:
+        if c.tag == "note":
+            if c.find("grace") is not None or c.find("chord") is not None:
+                continue
+            d = _int(c.find("duration"))
+            key = ((c.findtext("staff") or "1").strip(), (c.findtext("voice") or "1").strip())
+            x = c.get("default-x")
+            try:
+                xv = float(x) if x else None
+            except ValueError:
+                xv = None
+            out.setdefault(key, []).append((c, pos, d, xv, c.find("rest") is not None))
+            pos += d
+        elif c.tag == "backup":
+            pos -= _int(c.find("duration"))
+        elif c.tag == "forward":
+            pos += _int(c.find("duration"))
+    return out
+
+
+def _insert_rests(measure: ET.Element, before: ET.Element, amount_q: Fraction, divisions: int,
+                  voice: str, staff: str) -> bool:
+    """Insert rests totalling `amount_q` before note `before`: the notes after
+    them move later, so the voice's next <backup> grows by as much."""
+    pieces = _decompose(amount_q)
+    durs = [ql * divisions for ql, _, _ in pieces]
+    if not pieces or any(d.denominator != 1 or d <= 0 for d in durs):
+        return False
+    children = list(measure)
+    at = children.index(before)
+    nxt = next((c for c in children[at:] if c.tag == "backup"), None)
+    for (_, name, dotted), d in zip(pieces, durs):
+        measure.insert(at, _rest(int(d), name, dotted, voice, staff))
+        at += 1
+    if nxt is not None:
+        nxt.find("duration").text = str(_int(nxt.find("duration")) + int(sum(durs)))
+    return True
+
+
+def _retime_by_position(parts: list[ET.Element], contexts: list) -> list[str]:
+    """OMR that misses a rest or a dot inside a bar makes the notes after it
+    early, and the staff ends before the bar line. When other staves fill the
+    bar, the early notes still stand where they belong on the page: under the
+    notes of the other staves that are played later. Put the missing time
+    back (as a rest) where the notes start to line up again."""
+    notes = []
+    n = max((len(p.findall("measure")) for p in parts), default=0)
+    for i in range(n):
+        voices, refs = [], []
+        for p, ctx in zip(parts, contexts):
+            ms = p.findall("measure")
+            if i >= len(ms) or i >= len(ctx) or not ctx[i][0] or ctx[i][1] is None:
+                continue
+            div, bar_q = ctx[i]
+            rest_only = _rest_only_staves(ms[i])
+            for key, ev in _voice_events(ms[i]).items():
+                if key[0] in rest_only or not ev:
+                    continue
+                end = Fraction(ev[-1][1] + ev[-1][2], div)
+                voices.append((p, ms[i], div, bar_q, key, ev, end))
+                if end == bar_q:
+                    refs += [(x, Fraction(on, div)) for _, on, _, x, rest in ev
+                             if x is not None and not rest]
+        if not refs:
+            continue
+        for p, m, div, bar_q, key, ev, end in voices:
+            short = bar_q - end
+            if short <= 0:
+                continue
+            for j, (el, on, _, x, rest) in enumerate(ev):
+                if x is None or rest:
+                    continue
+                here = Fraction(on, div)
+                there = {o for rx, o in refs if abs(rx - x) <= _ALIGN_TOL}
+                if not there or here in there:
+                    continue
+                later = sorted(o - here for o in there if o > here)
+                if not later or later[0] > short:
+                    continue
+                shift = later[0]
+                # every later note that lines up with another staff agrees
+                if any(x2 is not None and not rest2
+                       and (m2 := {o for rx, o in refs if abs(rx - x2) <= _ALIGN_TOL})
+                       and Fraction(on2, div) + shift not in m2
+                       for _, on2, _, x2, rest2 in ev[j:]):
+                    break
+                # The time went missing after the last note that is confirmed
+                # where it is (it lines up with another staff at its onset);
+                # notes between that one and this one have nothing to line up with.
+                at = j
+                for k in range(j - 1, -1, -1):
+                    el2, on2, _, x2, rest2 = ev[k]
+                    if x2 is not None and not rest2 and Fraction(on2, div) in {
+                            o for rx, o in refs if abs(rx - x2) <= _ALIGN_TOL}:
+                        at = k + 1
+                        break
+                target, start_q = ev[at][0], Fraction(ev[at][1], div)
+                if _insert_rests(m, target, shift, div, key[1], key[0]):
+                    who = "{part:" + (p.get("id") or "?") + "}"
+                    notes.append(f"Measure {_num(m, i)}: {who} was read {_fmt(shift)} beat early "
+                                 f"from beat {_fmt(start_q + 1)} on (a rest or a dot not "
+                                 "recognised); moved to line up with the other staves.")
+                break
+    return notes
 
 
 def _time_quarters(time_el: ET.Element) -> Fraction | None:
@@ -1472,9 +2116,15 @@ def _pad_by_duration(measure: ET.Element, divisions: int, bar_q: Fraction) -> bo
     bar_div = bar_q * divisions
     if bar_div.denominator != 1:
         return False
+    rest_only = _rest_only_staves(measure)
+    if rest_only and not set(t.staff_end) - rest_only:
+        # Only whole-bar rests, of the wrong length: Verovio would play the
+        # bar in no time. Give them the bar's length.
+        _set_measure_rests(measure, int(bar_div))
+        return True
     plans = []
     for staff, end in t.staff_end.items():
-        if end >= bar_div:
+        if end >= bar_div or staff in rest_only:
             continue
         cands = [(v, info) for (s, v), info in t.voice_last.items() if s == staff]
         if not cands:
@@ -1497,7 +2147,16 @@ def _pad_by_heard(measure: ET.Element, divisions: int, amount_q: Fraction) -> bo
     t = _Timing(measure)
     done = False
     plans = []
+    rest_only = _rest_only_staves(measure)
+    if rest_only and not set(t.staff_end) - rest_only:
+        add = amount_q * divisions
+        if add.denominator != 1:
+            return False
+        _set_measure_rests(measure, max(t.staff_end.values()) + int(add))
+        return True
     for staff in t.staff_end:
+        if staff in rest_only:
+            continue
         cands = [(v, info) for (s, v), info in t.voice_last.items() if s == staff]
         if cands:
             voice, (_, idx, _) = max(cands, key=lambda c: c[1][0])
@@ -1564,6 +2223,15 @@ def _set_time_at(parts: list[ET.Element], index: int, beats: int, beat_type: int
 _MIN_GAP = Fraction(1, 2)  # quarter notes: holes shorter than an eighth are ignored
 
 
+def name_parts(notes: list[str], root: ET.Element) -> list[str]:
+    """Fill in the '{part:ID}' placeholders repair() writes with the parts'
+    names in `root` (the names they get when engraved)."""
+    names = {sp.get("id"): (sp.findtext("part-name") or "").strip() or sp.get("id")
+             for sp in root.iter("score-part")}
+    return [re.sub(r"\{part:([^}]*)\}", lambda m: names.get(m.group(1)) or m.group(1), n)
+            for n in notes]
+
+
 def staff_gaps(root: ET.Element) -> list[str]:
     """Bars where a staff has neither notes nor rests for part of the bar.
 
@@ -1598,6 +2266,8 @@ def staff_gaps(root: ET.Element) -> list[str]:
                         pos += dur
                     staff = (c.findtext("staff") or "1").strip()
                     spans.setdefault(staff, []).append((start, start + dur))
+            for staff in _rest_only_staves(m):
+                spans.pop(staff, None)  # a whole-bar rest fills its staff, whatever its length
             if spans:
                 found.append((part, i, m, div, spans))
     # The bar lasts as long as its longest staff in any part.
@@ -1697,9 +2367,93 @@ def repair(root: ET.Element, heard: Callable[[ET.Element], list[Fraction]],
         return bars[i] is not None and lengths[i] < bars[i] - TOL
 
 
+    contexts_all = [_part_context(p) for p in parts]
+    if apply:
+        rep.notes += _retime_by_position(parts, contexts_all)
+
+    def music_lengths(i: int) -> list[tuple[ET.Element, Fraction]]:
+        """(part, length in quarters) for each staff with music in bar i."""
+        out = []
+        for p, ctx in zip(parts, contexts_all):
+            ms = p.findall("measure")
+            if i < len(ms) and i < len(ctx) and ctx[i][0]:
+                out += [(p, Fraction(e, ctx[i][0])) for e in _music_ends(ms[i]).values()]
+        return out
+
+    def fit(i: int, length: Fraction) -> int | None:
+        """Cut bar i back to `length` quarters in every part; the number of
+        notes removed, or None (and nothing changed) if it cannot be done."""
+        saved = [copy.deepcopy(p.findall("measure")[i]) if i < len(p.findall("measure")) else None
+                 for p in parts]
+        removed = added = 0
+        for p, ctx in zip(parts, contexts_all):
+            ms = p.findall("measure")
+            if i >= len(ms) or not ctx[i][0]:
+                continue
+            limit = length * ctx[i][0]
+            ok, r, a = ((False, 0, 0) if limit.denominator != 1
+                        else _clamp(ms[i], int(limit), ctx[i][0]))
+            removed += r
+            added += a
+            if not ok:
+                for q, orig in zip(parts, saved):
+                    if orig is not None:
+                        cur = q.findall("measure")[i]
+                        cur.clear()
+                        cur.attrib.update(orig.attrib)
+                        cur.extend(list(copy.deepcopy(orig)))
+                return None
+        rep.added += added
+        return removed
+
+    def names_of(ps) -> str:
+        """Placeholders for the parts, filled in with the names the parts
+        get when they are engraved (see part_names)."""
+        seen = []
+        for q in ps:
+            label = "{part:" + (q.get("id") or "?") + "}"
+            if label not in seen:
+                seen.append(label)
+        return ", ".join(seen)
+
     exempt: set[int] = set()
     kept: list[str] = []
-    pickup = short(0) and (measures0[0].get("implicit") == "yes" or measures0[0].get("number") == "0"
+    fitted_pickup = False
+    marked = measures0[0].get("implicit") == "yes" or measures0[0].get("number") == "0"
+    ends0 = music_lengths(0)
+    disagree = len({e for _, e in ends0}) > 1
+    if apply and short(0) and not marked and len(ends0) >= 3 and disagree:
+        # A first bar whose staves (3 or more with music) stop at different
+        # points was misread (a dot or a flag). If more staves stop at one
+        # point than at any other, it is a pickup of that length, even when
+        # OMR did not mark it: fit the others to it.
+        ranked = Counter(e for _, e in ends0).most_common()
+        length, count = ranked[0]
+        if count >= 2 and (len(ranked) == 1 or ranked[1][1] < count):
+            if 0 < length < bars[0] - TOL:
+                longer = [q for q, e in ends0 if e > length + TOL]
+                shorter = [q for q, e in ends0 if e < length - TOL]
+                removed = fit(0, length) if longer else 0
+                if removed is not None:
+                    for q, ctx in zip(parts, contexts_all):
+                        if q in shorter and ctx[0][0]:
+                            _pad_by_duration(q.findall("measure")[0], ctx[0][0], length)
+                    fitted_pickup = True
+                    rep.removed += removed
+                    if longer or shorter:
+                        rep.notes.append(
+                            f"Measure {num(0)} is a pickup of {_fmt(length)} beats; "
+                            f"{names_of(longer + shorter)} did not add up to that (probably a "
+                            "misread dot or flag) and were fitted to it"
+                            + (f", removing {removed} note{'s' if removed != 1 else ''}"
+                               if removed else "") + ". Check it.")
+    if apply and short(0) and not marked and len(ends0) >= 3 and disagree and not fitted_pickup:
+        # Padding it to a full bar would put a long silence after a pickup.
+        fitted_pickup = True
+        rep.unfixed.append(num(0))
+        rep.notes.append(f"Measure {num(0)}: the staves disagree on how long this first bar is "
+                         "(a pickup with a misread dot or flag?); left as it is. Check it.")
+    pickup = short(0) and (fitted_pickup or marked
                            or (short(n - 1) and abs(lengths[0] + lengths[n - 1] - bars[0]) <= TOL))
     if pickup:
         exempt.update({0, n - 1})
@@ -1740,6 +2494,25 @@ def repair(root: ET.Element, heard: Callable[[ET.Element], list[Fraction]],
             fwd = i + 1
     for i in range(n):
         if bars[i] is not None and lengths[i] > bars[i] + TOL and i not in merged:
+            # When at least half of the staves fill the bar exactly, the ones
+            # that run past the bar line are misread (a dot, a flag, a
+            # tuplet, a time signature read as notes). Cut them back, or
+            # every later bar would sound late.
+            ends = music_lengths(i)
+            full = sum(1 for _, e in ends if abs(e - bars[i]) <= TOL)
+            over = [q for q, e in ends if e > bars[i] + TOL]
+            if apply and full and full * 2 >= len(ends) and over:
+                removed = fit(i, bars[i])
+                if removed is not None:
+                    rep.trimmed.append(num(i))
+                    rep.removed += removed
+                    rep.notes.append(
+                        f"Measure {num(i)}: {names_of(over)} ran past the bar line (probably a "
+                        "misread dot, flag, tuplet or time signature); cut back to it"
+                        + (f", removing {removed} note{'s' if removed != 1 else ''}"
+                           if removed else "")
+                        + ", so the bars after it keep time. Check it.")
+                    continue
             rep.overfull.append(num(i))
             rep.notes.append(f"Measure {num(i)} plays {_fmt(lengths[i])} beats in a "
                              f"{_fmt(bars[i])}-beat bar; check it.")
@@ -1768,6 +2541,8 @@ def repair(root: ET.Element, heard: Callable[[ET.Element], list[Fraction]],
         for p, ctx in zip(parts, contexts):
             ms = p.findall("measure")
             if i < len(ms) and ctx[i][0]:
+                # Whole-bar rests count here: a part resting through a short bar
+                # (a pickup the voice sings alone, say) is as short as the bar.
                 staff_end = _Timing(ms[i]).staff_end
                 ends += [Fraction(e, ctx[i][0]) for e in staff_end.values()]
                 with_music += bool(staff_end)

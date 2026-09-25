@@ -305,7 +305,8 @@ def _label_parts(text: str, plans) -> str:
         if sp is None or plan.kind != "voice":
             continue
         current = (sp.findtext("part-name") or "").strip()
-        if current and not parts.is_generic_name(current):
+        if current and not parts.is_generic_name(current) \
+                and not re.fullmatch(r"[IVXLC]+|\d+", current):  # 'I' is shown as 'Part I'
             continue
         label = "/".join(n for s in plan.group.staves for n in plan.names.get(s, []))
         if not label:
@@ -357,6 +358,8 @@ class MovementResult:
     xml: bytes  # after repair
     rendered: Rendered
     notes: list[str]
+    removed: int = 0  # notes the repair removed on purpose (and told the user about)
+    added: int = 0  # notes the repair added by splitting one into tied values
 
 
 def process_movement(job: MovementJob) -> MovementResult:
@@ -367,8 +370,10 @@ def process_movement(job: MovementJob) -> MovementResult:
                         layout=job.layout, video=job.video, parts_names=job.parts or None,
                         hands=job.hands)
     # After rendering, so the parts carry the names found for them.
-    gaps = musicxml.staff_gaps(musicxml.parse(r.xml or xml, job.title))
-    return MovementResult(xml=r.xml or xml, rendered=r, notes=report.notes + gaps)
+    engraved = musicxml.parse(r.xml or xml, job.title)
+    notes = musicxml.name_parts(report.notes, engraved) + musicxml.staff_gaps(engraved)
+    return MovementResult(xml=r.xml or xml, rendered=r, notes=notes,
+                          removed=report.removed, added=report.added)
 
 
 def _ignore_sigint() -> None:

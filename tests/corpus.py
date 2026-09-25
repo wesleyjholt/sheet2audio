@@ -87,7 +87,7 @@ def run_case(name: str, src: Path, gt: list[Path], extra: list[str], out: Path,
     else:
         proc = subprocess.run(
             [sys.executable, "-m", "sheet2audio.cli", str(src), "-o", str(dest), "-q",
-             "--no-video", "--no-viewer", "--formats", "wav", *extra],
+             "--no-video", "--no-viewer", "--formats", "mp3", *extra],
             capture_output=True, text=True, cwd=ROOT,
         )
         res = {"name": name, "exit": proc.returncode, "secs": round(time.monotonic() - t0, 1)}
@@ -114,8 +114,11 @@ def ledger_check(report: dict) -> dict:
     c = report.get("ledger") or {}
     problems = []
     for a, b in (("exported", "cleaned"), ("cleaned", "drawn"), ("drawn", "played")):
-        if c.get(a) is not None and c.get(b) is not None and c[b] < c[a]:
-            problems.append(f"{c[a] - c[b]} lost from {a} to {b}")
+        # notes the repair removed on purpose (named in the notes) are not lost
+        # (and notes it added by splitting one into tied values do not hide a loss)
+        allowed = ((c.get("removed") or 0) - (c.get("added") or 0)) if a == "exported" else 0
+        if c.get(a) is not None and c.get(b) is not None and c[b] + allowed < c[a]:
+            problems.append(f"{c[a] - allowed - c[b]} lost from {a} to {b}")
     omr_lost = max(0, (c.get("recognised") or 0) - (c.get("exported") or 0))
     named = any("more note" in n or "could not fit" in n for n in report.get("notes", []))
     if omr_lost and not named:
